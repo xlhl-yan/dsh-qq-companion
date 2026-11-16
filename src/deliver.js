@@ -30,8 +30,13 @@ export function humanAgo(timestampSeconds, nowMs = Date.now()) {
 export function buildWakePrompt(runtime, key, reason, nowMs = Date.now(), busy = false) {
   const unread = runtime.unread(key);
   const proactive = reason === 'proactive';
-  // 主动苏醒没有新消息 —— 那就把最近几轮对话当上下文，让它有依据判断要不要开口。
-  const shown = (proactive ? runtime.recent(key, 10) : unread).slice(-12);
+  // 忙时不展开消息内容：那一轮正在跑长任务，把十几条塞进它的上下文既挤 token，
+  // 也容易让它以为"当前任务被打断"。只报条数，让模型自己决定何时用 wait 拉取。
+  // 主动苏醒不受影响 —— 它本来就要看 recent 才能判断要不要开口。
+  const expand = proactive || !busy;
+  const shown = expand
+    ? (proactive ? runtime.recent(key, 10) : unread).slice(-12)
+    : [];
   const now = new Date(nowMs);
 
   // 时间：消息用的都是相对时间（"9 分钟前"），没有绝对锚点就对不上。
@@ -47,12 +52,16 @@ export function buildWakePrompt(runtime, key, reason, nowMs = Date.now(), busy =
   } else if (busy) {
     // 投递时这一轮还没结束 —— 消息是插到下一步的，不是从头开始的新一轮。
     // 不说清楚，模型会以为自己被打断、把前面做过的事重做一遍。
-    lines.push(`【QQ 新消息 · 你正在做事】（${unread.length} 条）· 现在 ${stamp}`);
-    lines.push('（手上那件没做完，不用重头再做一遍）');
+    const latestSeq = unread.length > 0 ? unread[unread.length - 1].seq : 0;
+    lines.push(`【QQ 新消息 · 你正在做事】有 ${unread.length} 条（最新 seq ${latestSeq}）`);
+    lines.push('（内容没展开 —— 想看就调 qq_wait_for_messages 拉进来）');
+    lines.push('（手上那件不用重头再做一遍）');
   } else {
     lines.push(`【QQ 新消息】（${unread.length} 条）· 现在 ${stamp}`);
   }
-  if (!proactive && unread.length > shown.length) {
+  // 只在真的展开过消息时才提"只列了 Recent N 条"；
+  // 忙时 shown 是空的（故意不展开），说"只列最近 0 条"毫无意义。
+  if (expand && !proactive && unread.length > shown.length) {
     lines.push(`（只列最近 ${shown.length} 条）`);
   }
   if (proactive && shown.length === 0) {
@@ -81,6 +90,8 @@ export function buildWakePrompt(runtime, key, reason, nowMs = Date.now(), busy =
   if (proactive) {
     // 主动苏醒的核心：不给任务，只给机会。说不说由它自己定。
     lines.push('想聊就用 qq_send_message；不想聊就什么都不调，安静结束这轮很正常。');
+  } else if (busy) {
+    lines.push('先把手上这件事做完；消息用 qq_wait_for_messages 拉，急事再停手回。');
   } else {
     lines.push('回话用 qq_send_message；想等对方说完用 qq_wait_for_messages；不回就 qq_mark_read。');
   }
