@@ -645,20 +645,19 @@ export class QQCompanionRuntime {
       );
     }
     if (delivered?.ok) {
-      this.log(`✓ 已送达 ${key}（${unread.length} 条，等 qq_mark_read 后再清 pending）`);
-      // 记住「这批已经投出去了」。pending 只该存没投出去的，
-      // 不能拿 unread 直接当数据源（标已读是手动的，会长期落后于投递）。
-      const seqs = this.buffer.unread(key).map((r) => r.seq);
-      const top = Math.max(latest?.seq ?? 0, ...seqs);
-      // 投递成功：这批从 ready 移到 unconfirmed —— 它们"送到了，但还没确认"。
-      // 投递失败的不搬，留在 ready 等下次重试（失败 ≠ 已送达，不能混进 unconfirmed）。
-      this.buffer.markDelivered(key, seqs);
-      this.#saveState();
-      // 注意：这里**不删 pending**。
-      // "投递成功"只代表消息进了 agent 的下一批输入，不代表模型看过 ——
-      // 长任务里 steer 进去可能要等很久才轮到处理。真正的"已处理"信号是
-      // qq_mark_read，pending 的删除时机放在那里（见 markRead()）。
-      // 残留的已读消息不会重投：恢复时按 watermark 过滤。
+      // **故意不 markDelivered**。
+      //
+      // 唤醒提示现在只报「有 N 条」，正文没有随提示交给模型 —— 所以这批消息
+      // 必须留在 ready 里，等模型自己用 qq_wait_for_messages / qq_get_unread_messages
+      // 来取。之前在这里无条件 markDelivered，导致提示说"有 1 条"、
+      // 两个读接口却都是空的（2026-11-16 实测，只能去翻聊天日志）。
+      //
+      // 「送达」的定义收窄为：**正文真的出现在模型可见的输出里**。
+      // 唤醒不算，wait 拿到才算（见 waitForMessages 的 resolve 包装）。
+      this.log(
+        `✓ 已唤醒 ${key}（提示只报条数，${unread.length} 条正文仍留在 ready 等模型来取）`,
+      );
+      // pending 也不删：这批还没被模型看过。
     }
   }
 
@@ -991,6 +990,21 @@ export class QQCompanionRuntime {
     return this.buffer.unread(key).map(toView);
   }
 
+  /**
+   * **模型视角的「未读」** = 还没 mark_read 的全部消息（ready + unconfirmed）。
+   *
+   * 和 unread() 的区别：
+   *   · ready        正文还没交给模型（唤醒只报了条数）
+   *   · unconfirmed  正文交过了（wait 拉的），但模型没标已读
+   *
+   * 对"还有什么没处理的"这个诉求来说两者都算未读，所以 get_unread 用这个。
+   * 只返回 ready 会造成：唤醒说"有 1 条"，get_unread 却是空数组（2026-11-16 反馈）。
+   */
+  pendingMessages(key) {
+    const all = [...this.buffer.unread(key), ...this.buffer.pendingConfirm(key)];
+    return all.sort((a, b) => a.seq - b.seq).map(toView);
+  }
+
   recent(key, limit = 10) {
     return this.buffer.recent(key, limit).map(toView);
   }
@@ -1173,8 +1187,9 @@ export class QQCompanionRuntime {
     // 那是把生产者的职责塞给了消费者，同一个静默概念还被复制到三处。
     const existing = this.buffer.unread(key);
     if (existing.length >= minCount) {
-      // 交付 = 送达。标记之后这批进 unconfirmed，下次唤醒不会再投一遍。
-      this.buffer.markDelivered(existing.map((r) => r.seq));
+      // 交付 = 送达（正文真的交到模型手上了）。标记之后这批进 unconfirmed，
+      // 下次唤醒报的是 ready 长度，不会再把它们算成"新消息"。
+      this.buffer.markDelivered(key, existing.map((r) => r.seq));
       this.#saveState();
       return Promise.resolve({ ok: true, immediate: true, messages: existing.map(toView) });
     }

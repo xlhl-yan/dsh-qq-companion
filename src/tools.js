@@ -122,7 +122,9 @@ export function createQQTools(runtime) {
         const key = String(args?.key ?? '');
         const stats = runtime.buffer.stats(key);
         return {
-          messages: runtime.unread(key),
+          // 返回「还没标已读」的全部 —— 包括已投递但模型没确认的。
+        // 只返回 ready 的话，模型收到"有 N 条"再调这个会是空数组（2026-11-16 反馈）。
+        messages: runtime.pendingMessages(key),
           watermark: stats.watermark,
           maxSeq: stats.maxSeq,
         };
