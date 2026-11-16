@@ -218,7 +218,11 @@ export class QQCompanionRuntime {
     this.busySessions.clear();
     this.client?.stop();
     this.client = null;
-    for (const resolve of this.waiters) resolve({ ok: false, why: 'runtime stopped' });
+    // this.waiters 存的是 waiter 对象（{key,minCount,resolve,...}），不是函数 ——
+    // 早期版本存过裸 resolve，改结构时这里漏改了，一 stop 就炸。
+    for (const waiter of this.waiters) {
+      try { waiter.resolve({ ok: false, why: 'runtime stopped' }); } catch { /* 已结束的跳过 */ }
+    }
     this.waiters.clear();
   }
 
@@ -330,6 +334,20 @@ export class QQCompanionRuntime {
 
     const timer = setTimeout(() => {
       this.bufferTimers.delete(key);
+      // 缓冲期到了 —— 这是「搬运」发生的地方：
+      // 把 staging 整批搬进 ready，消费者从这一刻起才看得见这批消息。
+      // 顺序不能反：先搬再通知，否则 notifyWaiters 读 ready 还是空的。
+      const moved = this.buffer.flushStaging(key);
+      if (moved > 0) this.log(`📦 ${key} 搬运 ${moved} 条 staging → ready`);
+
+      // 搬运完先看有没有长轮询在等：有就直接交付给它，别再叫醒 agent。
+      // 两边都消化同一批消息 = 用户说的「发一条消息，它回两遍」。
+      const satisfied = this.#notifyWaiters(key);
+      if (satisfied > 0) {
+        this.log(`（已通过 qq_wait_for_messages 直接送达，跳过缓冲期唤醒）`);
+        return;
+      }
+
       this.#deliverBuffered(key).catch((error) =>
         this.log(`✗ 缓冲唤起异常：${String(error?.message ?? error)}`),
       );
@@ -480,9 +498,9 @@ export class QQCompanionRuntime {
   #persistPending(key) {
     const file = this.#pendingFile(key);
     try {
-      const floor = this.deliveredSeq.get(key) ?? 0;
-      const records = this.buffer.unread(key)
-        .filter((r) => r.seq > floor)
+      // staging + ready 都要落盘：两者都还没送出去，崩溃后都得捡回来。
+      // （不算 unconfirmed —— 那些已经送达了，靠 mark_read 清理。）
+      const records = this.buffer.undelivered(key)
         .map((r) => ({
         seq: r.seq,
         messageId: r.messageId,
@@ -542,7 +560,9 @@ export class QQCompanionRuntime {
           fs.rmSync(file, { force: true });
           continue;
         }
-        const floor = this.deliveredSeq.get(key) ?? 0;
+        // 不需要再用 deliveredSeq 过滤：三队列里 ready 本身就只含未投递的，
+        // 而 buffer.restore() 内部会按 watermark 挡掉已读过的。
+        const floor = this.buffer.watermark(key);
         const records = (Array.isArray(data?.records) ? data.records : []).filter(
           (r) => Number(r?.seq) > floor,
         );
@@ -630,8 +650,10 @@ export class QQCompanionRuntime {
       // 不能拿 unread 直接当数据源（标已读是手动的，会长期落后于投递）。
       const seqs = this.buffer.unread(key).map((r) => r.seq);
       const top = Math.max(latest?.seq ?? 0, ...seqs);
-      if (Number.isFinite(top) && top > 0) this.deliveredSeq.set(key, top);
-      this.#saveState(); // 投递进度要落盘，否则重启后 floor 回 0、历史又被写回 pending
+      // 投递成功：这批从 ready 移到 unconfirmed —— 它们"送到了，但还没确认"。
+      // 投递失败的不搬，留在 ready 等下次重试（失败 ≠ 已送达，不能混进 unconfirmed）。
+      this.buffer.markDelivered(key, seqs);
+      this.#saveState();
       // 注意：这里**不删 pending**。
       // "投递成功"只代表消息进了 agent 的下一批输入，不代表模型看过 ——
       // 长任务里 steer 进去可能要等很久才轮到处理。真正的"已处理"信号是
@@ -1126,13 +1148,14 @@ export class QQCompanionRuntime {
    *   2) **同一会话只允许一个等待**（租约）。两个长轮询并存会互相踩水位、各回一遍。
    */
   waitForMessages(key, { timeoutMs = 60000, minCount = 1 } = {}) {
-    // ① 取消待发的缓冲期唤醒：AI 已经在主动等了，再叫它一次就是重复劳动。
-    const pendingTimer = this.bufferTimers.get(key);
-    if (pendingTimer !== undefined) {
-      clearTimeout(pendingTimer);
-      this.bufferTimers.delete(key);
-      this.log(`（${key} 开始主动等待，取消待发的缓冲期唤醒）`);
-    }
+    // 注意：这里**不取消搬运定时器**。
+    //
+    // 单队列时代取消它是对的（消息已可读，取消只是"别叫醒 agent"）；
+    // 三队列下取消它等于取消 staging → ready 的搬运，消息永远卡在 staging，
+    // wait 就永远等不到（2026-11-16 实测：8 秒超时、staging 仍剩 1 条）。
+    //
+    // 现在的分工是：搬运定时器照常跑，但一旦 wait 被满足，定时器回调里
+    // 会跳过 deliverBuffered —— 不会重复唤醒。
 
     // ② 同会话租约：已经有一个在等就直接拒绝，别让两个等待互相踩。
     if (this.activeWaits.has(key)) {
@@ -1142,20 +1165,18 @@ export class QQCompanionRuntime {
       });
     }
 
-    // 已有消息也要守缓冲期 —— 否则对方话没说完整，wait 就把半截话端走了。
-    // 只有"最后一条已经安静够久"才允许 immediate 返回。
+    // 只看 ready —— 这里**不做任何时间判断**。
+    //
+    // "该不该读"属于生产侧的判断（搬运定时器负责），消费者只该看到
+    // "有 / 没有"两种结果。曾经在这里算过静默期（2026-11-16 用户纠正：
+    // 「wait 就不应该有主动的行为，他只是在监听消息通道，仅此而已」），
+    // 那是把生产者的职责塞给了消费者，同一个静默概念还被复制到三处。
     const existing = this.buffer.unread(key);
-    const quietMs = Math.max(0, Number(this.config.wake?.bufferSeconds ?? 10)) * 1000;
-    const lastAt = this.lastMessageAt.get(key) ?? 0;
-    const elapsed = lastAt === 0 ? Number.POSITIVE_INFINITY : Date.now() - lastAt;
-    if (existing.length >= minCount && (quietMs === 0 || elapsed >= quietMs)) {
-      return Promise.resolve({ ok: true, immediate: true, messages: existing.map(toView) });
-    }
     if (existing.length >= minCount) {
-      this.log(
-        `⏳ ${key} 已有 ${existing.length} 条，但距最后一条才 ${Math.round(elapsed / 1000)}s` +
-          `（需静默 ${quietMs / 1000}s），继续等`,
-      );
+      // 交付 = 送达。标记之后这批进 unconfirmed，下次唤醒不会再投一遍。
+      this.buffer.markDelivered(existing.map((r) => r.seq));
+      this.#saveState();
+      return Promise.resolve({ ok: true, immediate: true, messages: existing.map(toView) });
     }
 
     return new Promise((resolve) => {
@@ -1167,6 +1188,13 @@ export class QQCompanionRuntime {
           if (waiter.quietTimer !== undefined) clearTimeout(waiter.quietTimer);
           this.waiters.delete(waiter);
           if (this.activeWaits.get(key) === leaseStamp) this.activeWaits.delete(key);
+          // 交付即送达：把这批从 ready 移到 unconfirmed。
+          // 不标记的话它们还留在 ready，下次唤醒会重复投递（"回两遍"）。
+          const seqs = (value?.messages ?? []).map((m) => Number(m.seq)).filter(Number.isFinite);
+          if (seqs.length > 0) {
+            this.buffer.markDelivered(key, seqs);
+            this.#saveState();
+          }
           resolve(value);
         },
       };
@@ -1190,29 +1218,13 @@ export class QQCompanionRuntime {
    */
   #notifyWaiters(key) {
     let satisfied = 0;
-    const quietMs = Math.max(0, Number(this.config.wake?.bufferSeconds ?? 10)) * 1000;
-
+    // 被调用时调用方已经把 staging 搬进 ready 了，所以这里直接交付。
+    // 不再有静默计时器 —— 那个职责属于搬运定时器，不属于这里。
     for (const waiter of [...this.waiters]) {
       if (waiter.key !== key) continue;
       const messages = this.buffer.unread(key);
       if (messages.length < waiter.minCount) continue;
-
-      // 静默期：对方可能还在连着发。第一条一到就 resolve 的话，模型会拿着
-      // 半句话开口（用户 2026-11-07 实测"发来就秒发送了"）。
-      // 期间又来消息就重新计时 —— 和正常唤醒的 debounce 同一套语义。
-      if (quietMs === 0) {
-        waiter.resolve({ ok: true, messages: messages.map(toView) });
-        satisfied += 1;
-        continue;
-      }
-      if (waiter.quietTimer !== undefined) clearTimeout(waiter.quietTimer);
-      waiter.quietTimer = setTimeout(() => {
-        waiter.quietTimer = undefined;
-        this.log(`⏳ ${key} 等待结束（静默 ${quietMs / 1000}s，共 ${this.buffer.unread(key).length} 条）`);
-        waiter.resolve({ ok: true, messages: this.buffer.unread(key).map(toView) });
-      }, quietMs);
-      waiter.quietTimer.unref?.();
-      // 已经安排好了交付，算作"满足"——调用方因此不会再排一次缓冲期唤醒。
+      waiter.resolve({ ok: true, messages: messages.map(toView) });
       satisfied += 1;
     }
     return satisfied;
