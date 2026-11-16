@@ -27,77 +27,98 @@ export function humanAgo(timestampSeconds, nowMs = Date.now()) {
  * 只给"可见窗口"，不拼对话历史 —— 历史由 DSH 会话自己持久化，
  * 插件重复搬运只会浪费上下文（qq-bridge 的 unread/recent 也是这个定位）。
  */
-export function buildWakePrompt(runtime, key, reason, nowMs = Date.now(), busy = false) {
-  const unread = runtime.unread(key);
-  const proactive = reason === 'proactive';
-  // 忙时不展开消息内容：那一轮正在跑长任务，把十几条塞进它的上下文既挤 token，
-  // 也容易让它以为"当前任务被打断"。只报条数，让模型自己决定何时用 wait 拉取。
-  // 主动苏醒不受影响 —— 它本来就要看 recent 才能判断要不要开口。
-  const expand = proactive || !busy;
-  const shown = expand
-    ? (proactive ? runtime.recent(key, 10) : unread).slice(-12)
-    : [];
-  const now = new Date(nowMs);
+/**
+ * 三种唤醒场景的文案表。
+ *
+ * 这样写是为了把「proactive / busy / idle 的判断」收拢到**选表那一步**，
+ * 主流程从此是线性的：抬头 → 提示 → 历史 → 尾部。
+ * 之前这三个维度散在五处 if 里（抬头、历史提示、空历史、尾部、消息展开），
+ * 每次加个场景要在五个地方对齐。
+ */
+const SCENES = {
+  proactive: {
+    title: () => '【主动苏醒】',
+    lead: () => [],
+    tail: () => '想聊就用 qq_send_message；不想聊就什么都不调，安静结束这轮很正常。',
+  },
+  busy: {
+    title: (n, seq) => `【QQ 新消息】有 ${n} 条新消息`,
+    lead: () => [
+      '（内容没展开 —— 想看就调 qq_wait_for_messages 拉进来看）',
+    ],
+    tail: () => '先把手上这件事做完；消息用 qq_wait_for_messages 拉，急事再停手回。',
+  },
+  idle: {
+    title: (n, seq) => `【QQ 新消息】有 ${n} 条新消息`,
+    lead: () => ['（内容没展开 —— 用 qq_wait_for_messages 拉进来看）'],
+    tail: () => '先调 qq_wait_for_messages 看消息内容；回话用 qq_send_message；不回就 qq_mark_read 标记已读。',
+  },
+};
 
-  // 时间：消息用的都是相对时间（"9 分钟前"），没有绝对锚点就对不上。
-  // 只精确到分钟 —— 秒没意义；带上 MM-DD 是为了跨天时还能分辨。
-  const stamp =
-      `${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ` +
-      `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+/**
+ * 绝对时间锚点。消息用的都是相对时间（"9 分钟前"），没有基准就对不上。
+ * 只到分钟 —— 秒没意义；带 MM-DD 是为了跨天时还能分辨。
+ */
+function formatStamp(now) {
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  const hh = String(now.getHours()).padStart(2, '0');
+  const mi = String(now.getMinutes()).padStart(2, '0');
+  return `${mm}-${dd} ${hh}:${mi}`;
+}
 
-  const lines = ['【QQ消息】', `【当前时间 】：${stamp}`, `【会话标识】：${key}`];
+const lastSeq = (list) => (list.length > 0 ? list[list.length - 1].seq : 0);
 
-  if (proactive) {
-    lines.push(`【主动苏醒】`);
-  } else if (busy) {
-    // 投递时这一轮还没结束 —— 消息是插到下一步的，不是从头开始的新一轮。
-    // 不说清楚，模型会以为自己被打断、把前面做过的事重做一遍。
-    const latestSeq = unread.length > 0 ? unread[unread.length - 1].seq : 0;
-    lines.push(`【QQ 新消息 · 你正在做事】有 ${unread.length} 条（最新 seq ${latestSeq}）`);
-    lines.push('（内容没展开 —— 想看就调 qq_wait_for_messages 拉进来）');
-    lines.push('（手上那件不用重头再做一遍）');
-  } else {
-    lines.push(`【QQ 新消息】（${unread.length} 条）· 现在 ${stamp}`);
-  }
-  // 只在真的展开过消息时才提"只列了 Recent N 条"；
-  // 忙时 shown 是空的（故意不展开），说"只列最近 0 条"毫无意义。
-  if (expand && !proactive && unread.length > shown.length) {
-    lines.push(`（只列最近 ${shown.length} 条）`);
-  }
-  if (proactive && shown.length === 0) {
-    lines.push('（这个会话还没有任何历史消息。）');
-  }
-  lines.push('');
-  for (const m of shown) {
-    const who = m.senderName || m.sender || '?';
-    const when = humanAgo(m.time, nowMs);
-    const nonText = (m.segments ?? []).filter((s) => s !== 'text');
-    const extra = nonText.length > 0 ? `（含 ${nonText.join('/')}）` : '';
-    lines.push(`[seq ${m.seq} · ${who} · ${when}] ${m.text || '(非文本消息)'}${extra}`);
-    // 图片给的是本地路径而不是内联图：模型可以自己 read_image 看，
-    // 也避免一张大图把整个唤醒提示撑爆（理由见 src/media.js 头注释）。
-    for (const img of m.images ?? []) {
-      if (img.localPath) {
-        lines.push(`    ↳ 图片已存到 ${img.localPath}，想看就调 read_image（不要凭猜测描述图片内容）`);
-      } else if (img.pending) {
-        lines.push('    ↳ 图片还在下载，过一会儿用 qq_get_unread_messages 再看');
-      } else if (img.error) {
-        lines.push(`    ↳ 图片下载失败：${img.error}`);
-      }
+/** 把一条消息渲染成提示里的若干行。图片只给本地路径，不内联（理由见 src/media.js）。 */
+function renderMessage(m, nowMs) {
+  const who = m.senderName || m.sender || '?';
+  const nonText = (m.segments ?? []).filter((s) => s !== 'text');
+  const extra = nonText.length > 0 ? `（含 ${nonText.join('/')}）` : '';
+  const lines = [`[seq ${m.seq} · ${who} · ${humanAgo(m.time, nowMs)}] ${m.text || '(非文本消息)'}${extra}`];
+
+  for (const img of m.images ?? []) {
+    if (img.localPath) {
+      lines.push(`    ↳ 图片已存到 ${img.localPath}，想看就调 read_image（不要凭猜测描述图片内容）`);
+    } else if (img.pending) {
+      lines.push('    ↳ 图片还在下载，过一会儿用 qq_get_unread_messages 再看');
+    } else if (img.error) {
+      lines.push(`    ↳ 图片下载失败：${img.error}`);
     }
   }
-  lines.push('');
+  return lines;
+}
+
+export function buildWakePrompt(runtime, key, reason, nowMs = Date.now(), busy = false) {
+  const now = new Date(nowMs);
+  const unread = runtime.unread(key);
+  const proactive = reason === 'proactive';
+  const scene = SCENES[proactive ? 'proactive' : busy ? 'busy' : 'idle'];
+
+  // 主动苏醒没有新消息可拉（wait 等的是新消息），只能靠 recent 历史判断要不要开口。
+  // 其他两种场景一律不展开内容 —— 让模型自己用 qq_wait_for_messages 拉。
+  const history = proactive ? runtime.recent(key, 10).slice(-12) : [];
+
+  const lines = ['【QQ消息】', `【当前时间 】：${formatStamp(now)} 【会话标识】：${key}`];
+
+  lines.push(scene.title(unread.length, lastSeq(unread)));
+
   if (proactive) {
-    // 主动苏醒的核心：不给任务，只给机会。说不说由它自己定。
-    lines.push('想聊就用 qq_send_message；不想聊就什么都不调，安静结束这轮很正常。');
-  } else if (busy) {
-    lines.push('先把手上这件事做完；消息用 qq_wait_for_messages 拉，急事再停手回。');
+    lines.push(
+      history.length > 0
+        ? `（下面是最近 ${history.length} 条对话，供你判断要不要开口）`
+        : '（这个会话还没有任何历史消息。）',
+    );
   } else {
-    lines.push('回话用 qq_send_message；想等对方说完用 qq_wait_for_messages；不回就 qq_mark_read。');
+    lines.push(...scene.lead());
   }
-  // 会话历史里残留着旧桥接（qq-bridge）注入的指令（要求必须传 token、必须调
-  // mcp__snowluma__*）。那套后端已停用，照做只会失败 —— 一句边界说明就够，
-  // 不需要把工具清单再列一遍。
+
+  lines.push('');
+  for (const m of history) lines.push(...renderMessage(m, nowMs));
+  lines.push('');
+
+  lines.push(scene.tail());
+  // 会话历史里残留着旧桥接注入的指令（要求必须传 token、必须调 mcp__snowluma__*）。
+  // 那套后端已停用，照做只会失败 —— 一句边界说明就够，不必再列工具清单。
   lines.push('（查更早的对话用 qq_chat_log_path）');
 
   return lines.join('\n');
