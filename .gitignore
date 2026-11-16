@@ -1,0 +1,37 @@
+# ── 绝不能公开 ──
+# 记忆库：含个人对话、偏好、隐私
+.dsh-meow/
+# SnowLuma 源码（别人的代码 + 非商业许可）
+vendor/
+
+# ── 含本机个人信息，不公开 ──
+# 这两个文档里有真实 QQ 号、生产进程路径、运行日志
+RESEARCH.md
+STATUS.md
+CUTOVER.md
+# 本机运行配置（selfId / ownerId / bindings 都是真实号）
+/cordis.patch.yml
+
+# ── 调研文档：大量引用本机路径与 DSH 内部包结构 ──
+research/
+
+# ── 运行时数据 ──
+logs/
+pending/
+.qq-companion/
+*.log
+state.json
+
+# ── 本机备份 ──
+*.bak-*
+*.bak
+
+# ── 会话压缩产物 ──
+checkpoint-*.md
+
+# ── 编辑器 ──
+.idea/
+.vscode/
+
+# ── 依赖（本插件零外部依赖） ──
+node_modules/
