@@ -37,8 +37,8 @@ export function humanAgo(timestampSeconds, nowMs = Date.now()) {
  */
 const SCENES = {
   proactive: {
-    title: () => '【主动苏醒】',
-    lead: () => [],
+    title: () => '【主动苏醒】现在没有新消息 —— 这是定时的主动苏醒',
+    lead: () => ['（聊什么由你定；上面那些对话就在你的上下文里，不用我再重复）'],
     tail: () => '想聊就用 qq_send_message；不想聊就什么都不调，安静结束这轮很正常。',
   },
   busy: {
@@ -69,57 +69,24 @@ function formatStamp(now) {
 
 const lastSeq = (list) => (list.length > 0 ? list[list.length - 1].seq : 0);
 
-/** 把一条消息渲染成提示里的若干行。图片只给本地路径，不内联（理由见 src/media.js）。 */
-function renderMessage(m, nowMs) {
-  const who = m.senderName || m.sender || '?';
-  const nonText = (m.segments ?? []).filter((s) => s !== 'text');
-  const extra = nonText.length > 0 ? `（含 ${nonText.join('/')}）` : '';
-  const lines = [`[seq ${m.seq} · ${who} · ${humanAgo(m.time, nowMs)}] ${m.text || '(非文本消息)'}${extra}`];
-
-  for (const img of m.images ?? []) {
-    if (img.localPath) {
-      lines.push(`    ↳ 图片已存到 ${img.localPath}，想看就调 read_image（不要凭猜测描述图片内容）`);
-    } else if (img.pending) {
-      lines.push('    ↳ 图片还在下载，过一会儿用 qq_get_unread_messages 再看');
-    } else if (img.error) {
-      lines.push(`    ↳ 图片下载失败：${img.error}`);
-    }
-  }
-  return lines;
-}
-
 export function buildWakePrompt(runtime, key, reason, nowMs = Date.now(), busy = false) {
   const now = new Date(nowMs);
   const unread = runtime.unread(key);
   const proactive = reason === 'proactive';
   const scene = SCENES[proactive ? 'proactive' : busy ? 'busy' : 'idle'];
 
-  // 主动苏醒没有新消息可拉（wait 等的是新消息），只能靠 recent 历史判断要不要开口。
-  // 其他两种场景一律不展开内容 —— 让模型自己用 qq_wait_for_messages 拉。
-  const history = proactive ? runtime.recent(key, 10).slice(-12) : [];
-
-  const lines = ['【QQ消息】', `【当前时间 】：${formatStamp(now)} 【会话标识】：${key}`];
-
-  lines.push(scene.title(unread.length, lastSeq(unread)));
-
-  if (proactive) {
-    lines.push(
-      history.length > 0
-        ? `（下面是最近 ${history.length} 条对话，供你判断要不要开口）`
-        : '（这个会话还没有任何历史消息。）',
-    );
-  } else {
-    lines.push(...scene.lead());
-  }
-
-  lines.push('');
-  for (const m of history) lines.push(...renderMessage(m, nowMs));
-  lines.push('');
-
-  lines.push(scene.tail());
-  // 会话历史里残留着旧桥接注入的指令（要求必须传 token、必须调 mcp__snowluma__*）。
-  // 那套后端已停用，照做只会失败 —— 一句边界说明就够，不必再列工具清单。
-  lines.push('（查更早的对话用 qq_chat_log_path）');
+  // 提示里**不带任何对话内容**：
+  //   · 新消息不展开 —— 让模型自己用 qq_wait_for_messages 拉；
+  //   · 主动苏醒也不附 recent —— 那段对话本来就在 DSH 会话的上下文里，
+  //     插件再从内存副本里捞一份是重复搬运（用户 2026-11-16 指出的）。
+  const lines = [
+    '【QQ消息】',
+    `【当前时间 】：${formatStamp(now)} 【会话标识】：${key}`,
+    scene.title(unread.length, lastSeq(unread)),
+    ...scene.lead(),
+    '',
+    scene.tail()
+  ];
 
   return lines.join('\n');
 }
