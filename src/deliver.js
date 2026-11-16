@@ -40,7 +40,7 @@ export function buildWakePrompt(runtime, key, reason, nowMs = Date.now(), busy =
       `${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ` +
       `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 
-  const lines = [`【当前时间 】：${stamp}`, `【会话标识】：${key}`];
+  const lines = ['【QQ消息】', `【当前时间 】：${stamp}`, `【会话标识】：${key}`];
 
   if (proactive) {
     lines.push(`【主动苏醒】`);

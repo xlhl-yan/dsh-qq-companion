@@ -1,0 +1,224 @@
+{
+  "format": "dsh-drawai",
+  "schemaVersion": 1,
+  "id": "305108f1-ca19-4967-a4bc-0da385958878",
+  "pages": [
+    {
+      "id": "117bdbb6-de21-4f60-81a3-afbb39525453",
+      "name": "第 1 页",
+      "doc": {
+        "version": 2,
+        "meta": {
+          "layout": "none",
+          "pageIndex": 0,
+          "pageCount": 1,
+          "pageNames": [
+            "第 1 页"
+          ],
+          "pinned": true
+        },
+        "nodes": [
+          {
+            "id": "n1",
+            "label": "三队列模型（改造后）",
+            "style": "rounded=0;whiteSpace=wrap;html=1;fontSize=18;fontColor=#1a1a1a;fillColor=none;strokeColor=none;text=1;align=center;verticalAlign=middle;",
+            "w": 400,
+            "h": 30,
+            "x": 380,
+            "y": 20
+          },
+          {
+            "id": "n2",
+            "label": "1. 缓冲队列 staging[]\n收到就进，任何消费者都看不见",
+            "style": "rounded=1;fillColor=#ffe6cc;strokeColor=#d79b00;",
+            "w": 220,
+            "h": 84,
+            "x": 60,
+            "y": 120
+          },
+          {
+            "id": "n3",
+            "label": "2. 消息队列 ready[]\n已定稿 · 唯一可读的地方",
+            "style": "rounded=1;fillColor=#d5e8d4;strokeColor=#82b366;",
+            "w": 220,
+            "h": 84,
+            "x": 400,
+            "y": 120
+          },
+          {
+            "id": "n4",
+            "label": "3. 未确认 unconfirmed[]\n送到了，模型还没确认",
+            "style": "rounded=1;fillColor=#dae8fc;strokeColor=#6c8ebf;",
+            "w": 220,
+            "h": 84,
+            "x": 740,
+            "y": 120
+          },
+          {
+            "id": "n5",
+            "label": "已确认 · 出队",
+            "style": "rounded=1;arcSize=50;fillColor=#f5f5f5;strokeColor=#666666;",
+            "w": 130,
+            "h": 50,
+            "x": 1060,
+            "y": 138
+          },
+          {
+            "id": "n6",
+            "label": "搬运定时器\n静默 bufferSeconds\n期间来新消息就重置",
+            "style": "fillColor=#fff2cc;strokeColor=#d6b656;",
+            "w": 220,
+            "h": 76,
+            "x": 60,
+            "y": 280
+          },
+          {
+            "id": "n8",
+            "label": "wait_for_messages\n（纯监听，无时间判断）",
+            "style": "fillColor=#e1d5e7;strokeColor=#9673a6;",
+            "w": 180,
+            "h": 66,
+            "x": 350,
+            "y": 300
+          },
+          {
+            "id": "n9",
+            "label": "唤醒 agent\ndeliverWake → steer",
+            "style": "fillColor=#e1d5e7;strokeColor=#9673a6;",
+            "w": 180,
+            "h": 66,
+            "x": 560,
+            "y": 300
+          },
+          {
+            "id": "n10",
+            "label": "qq_get_unread\n（只看 ready）",
+            "style": "fillColor=#e1d5e7;strokeColor=#9673a6;",
+            "w": 180,
+            "h": 66,
+            "x": 770,
+            "y": 300
+          },
+          {
+            "id": "n11",
+            "label": "只消费 ready —— 保证永远看不到半截话",
+            "style": "rounded=0;whiteSpace=wrap;html=1;fontSize=13;fontColor=#666666;fillColor=none;strokeColor=none;text=1;align=center;verticalAlign=middle;",
+            "w": 600,
+            "h": 26,
+            "x": 350,
+            "y": 390
+          },
+          {
+            "id": "n12",
+            "label": "落盘：ready + unconfirmed → state.json / pending\nstaging 不落盘（重启重新计时）",
+            "style": "rounded=0;whiteSpace=wrap;html=1;fontSize=12;fontColor=#666666;fillColor=none;strokeColor=none;text=1;align=center;verticalAlign=middle;",
+            "w": 480,
+            "h": 40,
+            "x": 740,
+            "y": 430
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "from": "n2",
+            "to": "n3",
+            "label": "静默够了\n整批搬过来",
+            "style": "rounded=1;html=1;strokeColor=#b85450;edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.5;entryX=0;entryY=0.5;endArrow=classic;drawaiRoutingMode=manual;"
+          },
+          {
+            "id": "e2",
+            "from": "n3",
+            "to": "n4",
+            "label": "投递成功\n(steer 返回 ok)",
+            "style": "rounded=1;html=1;strokeColor=#82b366;edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.5;entryX=0;entryY=0.5;endArrow=classic;drawaiRoutingMode=manual;"
+          },
+          {
+            "id": "e3",
+            "from": "n4",
+            "to": "n5",
+            "label": "mark_read(seq)\n按 seq 过滤",
+            "style": "rounded=1;html=1;strokeColor=#6c8ebf;edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;exitX=1;exitY=0.5;entryX=0;entryY=0.5;endArrow=classic;drawaiRoutingMode=manual;"
+          },
+          {
+            "id": "e4",
+            "from": "n4",
+            "to": "n3",
+            "label": "投递失败 → 退回",
+            "style": "rounded=1;html=1;strokeColor=#b85450;dashed=1;edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;exitX=0.5;exitY=0;entryX=0.5;entryY=0;endArrow=classic;drawaiRoutingMode=manual;",
+            "points": [
+              {
+                "x": 850,
+                "y": 76
+              },
+              {
+                "x": 510,
+                "y": 76
+              }
+            ]
+          },
+          {
+            "id": "e5",
+            "from": "n6",
+            "to": "n2",
+            "label": "收消息时重置",
+            "style": "rounded=1;html=1;strokeColor=#999999;dashed=1;dashPattern=1 2;edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;exitX=0.5;exitY=0;entryX=0.5;entryY=1;endArrow=none;drawaiRoutingMode=manual;"
+          },
+          {
+            "id": "e6",
+            "from": "n3",
+            "to": "n8",
+            "style": "rounded=1;html=1;strokeColor=#9673a6;edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;exitX=0.5;exitY=1;entryX=0.5;entryY=0;endArrow=classic;drawaiRoutingMode=manual;",
+            "points": [
+              {
+                "x": 450,
+                "y": 252
+              }
+            ]
+          },
+          {
+            "id": "e7",
+            "from": "n3",
+            "to": "n9",
+            "style": "rounded=1;html=1;strokeColor=#9673a6;edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;exitX=0.5;exitY=1;entryX=0.5;entryY=0;endArrow=classic;drawaiRoutingMode=manual;",
+            "points": [
+              {
+                "x": 510,
+                "y": 262
+              },
+              {
+                "x": 650,
+                "y": 262
+              }
+            ]
+          },
+          {
+            "id": "e8",
+            "from": "n3",
+            "to": "n10",
+            "style": "rounded=1;html=1;strokeColor=#9673a6;edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;exitX=0.5;exitY=1;entryX=0.5;entryY=0;endArrow=classic;drawaiRoutingMode=manual;",
+            "points": [
+              {
+                "x": 590,
+                "y": 282
+              },
+              {
+                "x": 860,
+                "y": 282
+              }
+            ]
+          }
+        ],
+        "layers": [
+          {
+            "id": "1",
+            "name": "",
+            "visible": true,
+            "locked": false
+          }
+        ],
+        "labels": []
+      }
+    }
+  ]
+}

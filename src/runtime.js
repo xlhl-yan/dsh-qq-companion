@@ -1142,10 +1142,22 @@ export class QQCompanionRuntime {
       });
     }
 
+    // 已有消息也要守缓冲期 —— 否则对方话没说完整，wait 就把半截话端走了。
+    // 只有"最后一条已经安静够久"才允许 immediate 返回。
     const existing = this.buffer.unread(key);
-    if (existing.length >= minCount) {
+    const quietMs = Math.max(0, Number(this.config.wake?.bufferSeconds ?? 10)) * 1000;
+    const lastAt = this.lastMessageAt.get(key) ?? 0;
+    const elapsed = lastAt === 0 ? Number.POSITIVE_INFINITY : Date.now() - lastAt;
+    if (existing.length >= minCount && (quietMs === 0 || elapsed >= quietMs)) {
       return Promise.resolve({ ok: true, immediate: true, messages: existing.map(toView) });
     }
+    if (existing.length >= minCount) {
+      this.log(
+        `⏳ ${key} 已有 ${existing.length} 条，但距最后一条才 ${Math.round(elapsed / 1000)}s` +
+          `（需静默 ${quietMs / 1000}s），继续等`,
+      );
+    }
+
     return new Promise((resolve) => {
       const waiter = {
         key,
@@ -1164,6 +1176,9 @@ export class QQCompanionRuntime {
       const leaseStamp = Date.now();
       this.activeWaits.set(key, leaseStamp);
       this.waiters.add(waiter);
+      // 已经有消息在缓冲区里：立刻排上静默计时，等它够了就交付。
+      // 不排的话要等到"下一条新消息"才会触发 #notifyWaiters，等于白等。
+      if (this.buffer.unread(key).length > 0) this.#notifyWaiters(key);
     });
   }
 
