@@ -1195,12 +1195,14 @@ export class QQCompanionRuntime {
     }
 
     return new Promise((resolve) => {
+      let timer = null;
+      let extended = false;
+
       const waiter = {
         key,
         minCount,
         resolve: (value) => {
-          clearTimeout(timer);
-          if (waiter.quietTimer !== undefined) clearTimeout(waiter.quietTimer);
+          if (timer !== null) clearTimeout(timer);
           this.waiters.delete(waiter);
           if (this.activeWaits.get(key) === leaseStamp) this.activeWaits.delete(key);
           // 交付即送达：把这批从 ready 移到 unconfirmed。
@@ -1213,9 +1215,45 @@ export class QQCompanionRuntime {
           resolve(value);
         },
       };
-      const timer = setTimeout(() => {
-        waiter.resolve({ ok: true, timeout: true, messages: this.buffer.unread(key).map(toView) });
-      }, Math.max(1000, Math.min(timeoutMs, 600000)));
+
+      /**
+       * 布一次定时；到点先看管道里有没有东西。
+       * isExtension=true 表示这已经是"再等一轮"，到点就真返回，不再续命。
+       */
+      const arm = (ms, isExtension) => {
+        timer = setTimeout(() => {
+          if (!isExtension) {
+            const stagingLeft = this.buffer.stagingCount(key);
+            if (stagingLeft > 0) {
+              // 缓冲期还没走完 —— 消息就在 staging 里排着，搬过来只是时间问题。
+              // 这时候返回空数组等于白等一轮。
+              //
+              // 延长量取**整轮 bufferSeconds**，不是"剩余时间"：
+              // 延长期间对方可能又发消息，搬运定时器会被重置、缓冲期从那一刻重计，
+              // 按剩余算的窗口就又不够了。给整轮不依赖"这期间不再来消息"这个假设。
+              const quietMs = Math.max(0, Number(this.config.wake?.bufferSeconds ?? 10)) * 1000;
+              const extra = Math.max(1000, quietMs);
+              extended = true;
+              this.log(
+                `⏳ ${key} wait 到时，但 staging 还有 ${stagingLeft} 条（缓冲期没走完），` +
+                  `再等 ${Math.round(extra / 1000)}s`,
+              );
+              arm(extra, true);
+              return;
+            }
+          }
+          waiter.resolve({
+            ok: true,
+            timeout: true,
+            extended,
+            messages: this.buffer.unread(key).map(toView),
+          });
+        }, ms);
+      };
+
+      const timeout = Math.max(1000, Math.min(timeoutMs, 600000));
+      arm(timeout, false);
+
       const leaseStamp = Date.now();
       this.activeWaits.set(key, leaseStamp);
       this.waiters.add(waiter);
