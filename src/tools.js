@@ -18,7 +18,7 @@
  * 注意 parameters 要**编译后的**标准 JSON Schema，不是官方源码里那种简写 spec。
  */
 
-import { sendImage, uploadPrivateFile } from './onebot.js';
+import { sendImage, sendVoice, uploadPrivateFile } from './onebot.js';
 
 
 const KEY_DESCRIPTION =
@@ -272,7 +272,7 @@ export function createQQTools(runtime) {
           caption: String(args?.caption ?? ''),
         });
         // 聊天日志要有来有回：图片也记一笔，"发了张图"同样是要复盘的信息。
-        runtime.logOutgoingImage(key, result);
+        runtime.logOutgoing(key, result, '图片');
         // ⚠️ 成功时**不要**带 error 字段。
         //
         // 这里踩过一个连环坑：一开始返回 `error: undefined` —— 过不了 DSH 的
@@ -280,6 +280,54 @@ export function createQQTools(runtime) {
         // 改成 `error: null` 之后又过不了 schema 校验，因为下面 properties 里
         // 写的是 `type: 'string'`，报 `"value.error" must be a string`。
         // 正确做法是**失败时才带这个字段**：schema 里没有 required，缺省合法。
+        return result.error ? result : { ok: result.ok, messageId: result.messageId, bytes: result.bytes };
+      },
+    },
+
+    {
+      name: 'qq_send_voice',
+      description:
+        '在 QQ 里发一条语音。voicePath 传本地音频绝对路径（mp3/wav/ogg/amr/m4a/aac/flac 都行，' +
+        'SnowLuma 会自动转成 QQ 的 silk 格式）。' +
+        '**和发图片/发文件不同：这个不能带配文** —— 想同时说句话，发完语音再单独调 qq_send_message。' +
+        '文件必须在 SnowLuma 所在的那台机器上。单条上限 20 MiB。',
+      parameters: {
+        type: 'object',
+        properties: {
+          key: { type: 'string', description: KEY_DESCRIPTION },
+          voicePath: {
+            type: 'string',
+            description: '本地音频文件的绝对路径。',
+          },
+        },
+        required: ['key', 'voicePath'],
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            messageId: { type: 'number' },
+            bytes: { type: 'number' },
+            error: { type: 'string' },
+          },
+        },
+        render: renderJson,
+      },
+      async execute(args) {
+        const key = String(args?.key ?? '');
+        const matched = /^(group|private):(\d+)$/.exec(key);
+        if (!matched) return { ok: false, error: `key 形状不合法：${key}` };
+        if (!runtime.endpoint) return { ok: false, error: '协议端点未就绪' };
+        const result = await sendVoice({
+          baseUrl: runtime.endpoint.baseUrl,
+          token: runtime.endpoint.token,
+          kind: matched[1],
+          target: matched[2],
+          voicePath: String(args?.voicePath ?? ''),
+        });
+        runtime.logOutgoing(key, result, '语音');
+        // 成功时不带 error 字段（理由见 qq_send_image 的注释）。
         return result.error ? result : { ok: result.ok, messageId: result.messageId, bytes: result.bytes };
       },
     },

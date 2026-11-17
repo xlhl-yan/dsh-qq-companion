@@ -255,6 +255,15 @@ export async function sendText({ baseUrl, token, kind, target, text, delayMs = 0
 const MAX_IMAGE_BYTES = 3 * 1024 * 1024;
 
 /**
+ * 语音大小上限 20 MiB。
+ *
+ * 和图片不同，语音走的是**文件路径**而不是 base64 内联，不经过 DSH 的附件通道，
+ * 所以没有 3.2 MiB 那个爆栈阈值。QQ 自己的语音上限大概十几 MB，
+ * 这里拦在 20 MiB 只为了在明显异常时早点报错（别传个整张专辑进来）。
+ */
+const MAX_VOICE_BYTES = 20 * 1024 * 1024;
+
+/**
  * 发送一张本地图片。
  *
  * OneBot 的 image 段 `data.file` 接受本地路径 / `file://` / `http(s)://` / `base64://`。
@@ -355,6 +364,63 @@ export async function uploadPrivateFile({
     ok: result.ok,
     fileId: result.data?.file_id ?? null,
     bytes: stat.size,
+    error: result.error ?? null,
+  };
+}
+
+/**
+ * 发一条语音。
+ *
+ * 2026-11-17 实测（SnowLuma 2.x，私聊）：
+ *  · OneBot action 列表里**没有** send_voice / send_record —— 语音走 `send_private_msg`
+ *    的 `record` 消息段。
+ *  · `can_send_record` 返回 `{yes: true}`，能力是有的。
+ *  · 源码里 `record.toSegment` 写的是 `file: element.fileId ?? ""`（看起来只吃 fileId），
+ *    但**实测直接给绝对路径也能用** —— 正斜杠 / 反斜杠 / `file:///` 三种都返回 retcode 0。
+ *    这里用绝对路径（最简单，且已实测通过）。
+ *  · 格式：SnowLuma 内部有 silk 转换，wav / mp3 / ogg / amr / m4a / aac / flac 都能发，
+ *    不需要自己转码。
+ *  · 文件必须在 **SnowLuma 所在的同一台机器**上（它按路径去 stat）。
+ */
+export async function sendVoice({
+  baseUrl,
+  token,
+  kind,
+  target,
+  voicePath,
+  timeoutMs = 60000,
+}) {
+  let stat;
+  try {
+    stat = fs.statSync(voicePath);
+  } catch (error) {
+    return { ok: false, error: `读不到音频：${String(error?.message ?? error)}` };
+  }
+  if (!stat.isFile()) {
+    return { ok: false, error: `不是文件：${voicePath}` };
+  }
+  if (stat.size > MAX_VOICE_BYTES) {
+    const mb = (stat.size / 1024 / 1024).toFixed(2);
+    return { ok: false, error: `音频 ${mb} MiB 超过上限 ${MAX_VOICE_BYTES / 1024 / 1024} MiB` };
+  }
+
+  const isGroup = kind === 'group';
+  const result = await call({
+    baseUrl,
+    token,
+    action: isGroup ? 'send_group_msg' : 'send_private_msg',
+    body: {
+      [isGroup ? 'group_id' : 'user_id']: Number(target),
+      message: [{ type: 'record', data: { file: voicePath } }],
+    },
+    timeoutMs,
+  });
+
+  return {
+    ok: result.ok,
+    messageId: result.data?.message_id ?? null,
+    bytes: stat.size,
+    // 成功时 result.error 是 undefined，必须兜底成 null 才是无损 JSON。
     error: result.error ?? null,
   };
 }

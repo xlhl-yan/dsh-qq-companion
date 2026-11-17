@@ -1138,13 +1138,19 @@ export class QQCompanionRuntime {
     this.#appendChat(key, line);
   }
 
-  logOutgoingImage(key, result) {
+  /**
+   * 记一条「发出去的东西」到日志。
+   *
+   * label 是给对方看的东西类型：图片 / 语音 / 文件。
+   * 原来叫 logOutgoingImage 且写死 `[图片]`，加语音后改名并把类型提出来。
+   */
+  logOutgoing(key, result, label = '图片') {
     const stamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
     const mark = result?.ok ? '✓' : '✗';
     const size = Number.isFinite(result?.bytes) ? ` ${result.bytes} 字节` : '';
     const id = result?.messageId === null || result?.messageId === undefined ? '' : ` (id ${result.messageId})`;
     const why = result?.error ? ` ${result.error}` : '';
-    const line = `↑ ${stamp} ${key} ${mark}${id} [图片${size}]${why}`;
+    const line = `↑ ${stamp} ${key} ${mark}${id} [${label}${size}]${why}`;
     this.log(line);
     this.#appendChat(key, line);
   }
