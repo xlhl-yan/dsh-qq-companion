@@ -1228,15 +1228,15 @@ export class QQCompanionRuntime {
               // 缓冲期还没走完 —— 消息就在 staging 里排着，搬过来只是时间问题。
               // 这时候返回空数组等于白等一轮。
               //
-              // 延长量取**整轮 bufferSeconds**，不是"剩余时间"：
-              // 延长期间对方可能又发消息，搬运定时器会被重置、缓冲期从那一刻重计，
-              // 按剩余算的窗口就又不够了。给整轮不依赖"这期间不再来消息"这个假设。
-              const quietMs = Math.max(0, Number(this.config.wake?.bufferSeconds ?? 10)) * 1000;
-              const extra = Math.max(1000, quietMs);
+              // "再等一轮" = **再等一个 timeoutMs**（用户 2026-11-17 明确：
+              // 「wait 5 分钟，发现缓冲区有新消息，那就再等 5 分钟，最多等一轮」）。
+              // 不是 bufferSeconds —— 缓冲期只决定消息什么时候搬过来，
+              // 而 wait 的节奏由它自己的 timeout 定。
+              const extra = timeout;
               extended = true;
               this.log(
                 `⏳ ${key} wait 到时，但 staging 还有 ${stagingLeft} 条（缓冲期没走完），` +
-                  `再等 ${Math.round(extra / 1000)}s`,
+                  `再等一轮 ${Math.round(extra / 1000)}s`,
               );
               arm(extra, true);
               return;
