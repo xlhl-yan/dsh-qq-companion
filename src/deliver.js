@@ -270,6 +270,21 @@ export async function deliverWake({
     if (!settled.ok) log(`… 图片下载未在期限内完成，先投递（提示里会标注）`);
   }
 
+  // ⚠️ 投递前最后一道闸（2026-11-18 用户实测反馈后加的）。
+  //
+  // 到这里已经隔了 `await resolveAgent()` + `await settleImages()` —— 几十毫秒到 2 秒。
+  // 这期间模型完全可能正好调了 `qq_wait_for_messages`：wait 走 immediate 分支
+  // 直接把 ready 里的这批交出去并 markDelivered。此时再 steer「有 N 条」，
+  // 模型就会同时看到「有 2 条新消息」和 wait 返回的那 2 条，像是被通知了两遍。
+  //
+  // 这里**在 steer 之前**再查一次：有人在等就放弃本次唤醒，让 wait 独占交付。
+  // 注意只挡得住"还没发出去的"—— 已经 steer 的撤不回来（DSH 没有 unsend）。
+  if (typeof runtime?.hasActiveWaiter === 'function' && runtime.hasActiveWaiter(key)) {
+    const why = '已有 qq_wait_for_messages 在等，这批消息由它直接交付，跳过插话';
+    log(`⏭ 跳过唤醒 ${key}：${why}`);
+    return { ok: false, skipped: true, why };
+  }
+
   const message = buildUserMessage(buildWakePrompt(runtime, key, reason, Date.now(), busy));
 
   // steer 是同步 void：插到最近的 step 边界，会唤醒 agent，但不返回回复。

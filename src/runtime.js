@@ -638,6 +638,12 @@ export class QQCompanionRuntime {
     // 只有真的投出去了才删文件。投递失败（会话取不到、steer 抛错）就留着，
     // 下次启动还能捡回来 —— 这正是这个文件存在的意义。
     if (!delivered?.ok) {
+      // "跳过"不算失败：消息没丢，只是被 wait 直接交付了（正文真的到了模型手上）。
+      // 记成失败会误导排查 —— 日志里会写"投递失败"，而实际上那批消息已经读过了。
+      if (delivered?.skipped) {
+        this.log(`⏭ ${key} 唤醒跳过：${delivered.why ?? '已被 wait 接管'}`);
+        return;
+      }
       // 结果也要记：不然「消息丢了」时，日志里只有"收到了"，看不出送到没送到 AI 那里。
       this.log(
         `✗ 投递失败 ${key}（${unread.length} 条留在 pending，下次启动重试）：` +
@@ -988,6 +994,22 @@ export class QQCompanionRuntime {
 
   unread(key) {
     return this.buffer.unread(key).map(toView);
+  }
+
+  /**
+   * 这个会话现在有没有长轮询在等？
+   *
+   * 用途：唤醒投递前的最后一道闸。`#deliverBuffered` 在**开头**拍了 unread 快照，
+   * 但真正的 steer 发生在 `await resolveAgent()` / `await settleImages()` 之后 ——
+   * 那几百毫秒到 2 秒里模型完全可能正好调了 `qq_wait_for_messages`。
+   * 这时消息已经直接交给 wait 了，再插一条「有 N 条」就是同一批说两遍
+   * （2026-11-18 用户从 UI 上看到的「wait 和插话同时生效」）。
+   *
+   * 注意：这只能拦住"还没 steer 出去"的。**已经 steer 的撤不回来**
+   * —— DSH 没有 unsend，`agent.steer()` 一旦调用就进了对方的 inbox。
+   */
+  hasActiveWaiter(key) {
+    return this.activeWaits.has(key);
   }
 
   /**
