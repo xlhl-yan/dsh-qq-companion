@@ -15,6 +15,8 @@ import { ConversationBuffer, isSelf, senderOf } from './buffer.js';
 import { conversationOf } from './session-map.js';
 import { extractText, nonTextTypes, segmentsOf } from './message.js';
 import { downloadImage, imageSegmentsOf } from './media.js';
+import { computeIntervalMs, skipQuietWindow, evaluateDue } from './schedule.js';
+import { createWorkdayCalendar, parseWorkSpans } from './workday.js';
 
 const DEFAULT_WAKE = {
   /**
@@ -43,6 +45,38 @@ const DEFAULT_WAKE = {
   minIntervalSec: 20,
   /** 每小时最多唤醒几次。超限是**延后**不是丢弃（qq-bridge 的教训）。 */
   maxPerHour: 12,
+
+  // ── 排期（2026-11-19 新增）─────────────────────────────
+  /**
+   * 随机抖动幅度。0.15 = ±15%。
+   *
+   * 为什么要有抖动：固定间隔会让苏醒时间像机器（而且重启后总是同一个偏移量）。
+   * 用户 2026-11-19：「真实可能是15%也可能是10%，这就是他支持可配置的优势」。
+   */
+  jitterRatio: 0.15,
+  /**
+   * 工作时段的抖动倍数。
+   *
+   * ⚠️ **这是"抖动幅度"的倍数，不是"间隔"的倍数。**
+   *   非工作：base × (1 + rand(-j, +j))        对称
+   *   工作：  base × (1 + |rand(-j, +j)| × m)  取绝对值，只变长
+   *
+   * 和旧配置 `workMultiplier`（间隔 ×m）差一倍 —— base=45、j=15%、m=2 时
+   * 本规则 58.5 分，旧规则 103.5 分。
+   */
+  workJitterMultiplier: 2,
+  /**
+   * 工作时段，形如 `09:00-11:30, 13:00-17:30`（设置页文本框直接填）。
+   * 空 = 不做工作时段区分，全天按非工作时段算。
+   */
+  workHours: '',
+  /** 基础工作日（1=周一 … 7=周日），逗号分隔。节假日/调休由 workday.js 覆盖。 */
+  workDays: '1,2,3,4,5',
+  /**
+   * 排期过期超过「间隔 × 这个倍数」时，不补醒而是重排。
+   * 场景：电脑休眠一夜，醒来时排期已经过期 8 小时 —— 不该早上一开机就被叫。
+   */
+  overdueResetRatio: 2,
 };
 
 /**
@@ -116,6 +150,39 @@ export class QQCompanionRuntime {
      */
     this.lastProactiveAt = new Map();
     /**
+     * key -> 主动苏醒的**排期**（`{ nextAt, intervalSec, reason }`）。
+     *
+     * 为什么不沿用 `lastProactiveAt + 固定间隔`：那个是"跑完一轮再排下一轮"的
+     * 链式 setTimeout，**进程一重启计时就从头开始**（2026-11-18 用户实测：
+     * 「重启了他的计时器也重启了，所以很尴尬」）。
+     *
+     * 这里存的是**绝对时间戳**，落盘到 state.json。重启后读回来继续等，
+     * 不需要"从零开始数 45 分钟"。
+     *
+     * 和 `lastProactiveAt` 的分工：
+     *   · lastProactiveAt —— 冷却用（两次苏醒至少隔 minIntervalMs），**不被消息刷新**
+     *   · wakeSchedule    —— 排期用，**会被"主人最近说话"刷新**（聊完才开始计时）
+     * 两个混用就会重踩 2026-11-03 那个"越聊天越不主动"的坑。
+     */
+    this.wakeSchedule = new Map();
+
+    /** 上一轮轮询还没跑完 —— 防止 steer 卡住时叠出第二轮。 */
+    this.pollBusy = false;
+
+    /**
+     * 工作日日历（节假日 + 调休）。
+     *
+     * 放构造时创建、`start()` 里 warmup：日历对象本身是纯本地的，
+     * 但拉数据要联网，不该在构造函数里 await（会让插件启动变慢）。
+     *
+     * 数据缺失时 `isWorkday` 会退化成"只看星期几"，不会抛错。
+     */
+    this.workdayCalendar = createWorkdayCalendar({
+      cacheDir: path.join(config.baseDir || process.cwd(), 'holidays'),
+      log: (line) => this.log(line),
+      workDays: config.wake?.workDays,
+    });
+    /**
      * key -> 已经成功投递出去的最大 seq。
      *
      * pending 文件不能拿 buffer.unread() 当数据源：unread 的语义是
@@ -164,6 +231,19 @@ export class QQCompanionRuntime {
     // 排在后面的话，SnowLuma 没起来就直接 return，pending 永远轮不到被读
     // —— 那"消息不会丢"这个承诺在最需要它的场景（崩溃后重启）就失效了。
     this.#restorePending();
+
+    // 预热节假日日历（当年 + 下一年）。
+    //
+    // 不 await：拉不到就算了，isWorkday 会退化成"只看星期几"，
+    // 而且这件事跟能不能收消息完全无关 —— 不该阻塞启动。
+    this.workdayCalendar
+      ?.warmup?.()
+      .then((years) => {
+        if (Array.isArray(years) && years.length > 0) {
+          this.log(`📅 工作日日历已就绪（${years.join(', ')}）`);
+        }
+      })
+      .catch((error) => this.log(`⚠️ 节假日预热失败：${String(error?.message ?? error)}`));
 
     const ephemeral = this.config.snowLuma ?? {};
     const found = await discoverEndpoint({
@@ -303,6 +383,16 @@ export class QQCompanionRuntime {
     const satisfiedWaiters = this.#notifyWaiters(conv.key);
 
     if (this.config.observeOnly) return;
+
+    // 有人说话 → 主动苏醒的排期往后推。
+    //
+    // 放在 satisfiedWaiters 判断**之前**：不管这条消息最终是走 wait 直接交付、
+    // 还是走缓冲期唤醒，"有人在聊"这个事实是一样的，排期都该重新起算。
+    //
+    // 这条是 2026-11-19 用户实测反馈的根治办法：「我刚跟会话完成一轮对话，
+    // 刚静下来 10 分钟，然后被主动唤醒重新拉起了会话」—— 因为那时排期是
+    // 按"上次苏醒 + 固定间隔"算的，跟你什么时候说完话完全无关。
+    this.#postponeWakeSchedule(conv.key);
 
     // ⚠️ 如果有长轮询在等，这条消息**已经直接交给它了** —— agent 会带着这批消息
     // 在同一次工具调用里继续跑。此时再安排缓冲期唤醒 = 把同一批消息叫醒两次，
@@ -454,6 +544,8 @@ export class QQCompanionRuntime {
           savedAt: Date.now(),
           buffer: this.buffer.snapshot(),
           deliveredSeq: Object.fromEntries(this.deliveredSeq),
+          // 主动苏醒排期：绝对时间戳，重启后接着等（不重置成"从现在起 N 分钟"）
+          wakeSchedule: Object.fromEntries(this.wakeSchedule),
         };
         fs.mkdirSync(path.dirname(this.stateFile), { recursive: true });
         fs.writeFileSync(this.stateFile, JSON.stringify(payload), 'utf8');
@@ -490,8 +582,38 @@ export class QQCompanionRuntime {
       if (keys > 0) {
         this.log(`↺ 已恢复水位（${keys} 个会话，nextSeq ${this.buffer.nextSeq}）`);
       }
-    } catch {
-      /* 文件不存在或坏了：当作首次启动，水位从 0 开始 */
+
+      // 主动苏醒排期：绝对时间戳，读回来继续等。
+      // 只接受"数字 + 有限值"的 nextAt，坏数据直接跳过 —— 一个烂条目不该
+      // 让整个会话的排期失效（那样它会退化成"立刻醒一次"）。
+      let restored = 0;
+      for (const [key, row] of Object.entries(data?.wakeSchedule ?? {})) {
+        const nextAt = Number(row?.nextAt);
+        if (!Number.isFinite(nextAt) || nextAt <= 0) continue;
+        this.wakeSchedule.set(key, {
+          nextAt,
+          intervalSec: Number(row?.intervalSec) || 0,
+          reason: typeof row?.reason === 'string' ? row.reason : '',
+        });
+        restored += 1;
+      }
+      if (restored > 0) {
+        const soonest = Math.min(...[...this.wakeSchedule.values()].map((r) => r.nextAt));
+        const mins = Math.max(0, Math.round((soonest - Date.now()) / 60000));
+        this.log(`↺ 已恢复主动苏醒排期（${restored} 个会话，最近一次在 ${mins} 分钟后）`);
+      }
+    } catch (error) {
+      // 文件不存在 = 首次启动，正常路径，不用吵。
+      //
+      // 但**其他**错误必须说出来：2026-11-19 调试排期持久化时，就是这里
+      // 一个空的 catch 把真实错误吞了，表现成"排期存了但读不回来"，
+      // 查了好几轮才想到是解析失败。静默失效比明着失败难查得多。
+      if (error?.code !== 'ENOENT') {
+        this.log(
+          `✗ 状态文件读取失败（${this.stateFile}）：${String(error?.message ?? error)}` +
+            ` —— 水位和排期都会从零开始`,
+        );
+      }
     }
   }
 
@@ -806,27 +928,31 @@ export class QQCompanionRuntime {
    */
   #startProactiveTimer() {
     this.#stopPoller();
-    const schedule = () => {
-      const raw = Number(this.config.wake?.wakeIntervalSec ?? 300);
-      // 下限 10 秒：苏醒是真的叫醒模型，配得太密等于持续烧钱。
-      const seconds = Number.isFinite(raw) && raw >= 10 ? raw : 300;
-      this.pollTimer = setTimeout(() => {
-        // 链式 setTimeout 而非 setInterval：每次重读配置，改了间隔能跟上。
-        this.proactiveTick()
-          .catch((error) => this.log(`✗ 主动苏醒异常：${String(error?.message ?? error)}`))
-          .finally(() => {
-            if (this.pollTimer !== null) schedule();
-          });
-      }, seconds * 1000);
-      // 不因为一个定时器把进程挂住（DSH 退出时能干净结束）。
-      this.pollTimer.unref?.();
+
+    // 2026-11-19 改造：**固定 5 分钟轮询**，不再是"间隔到了再 setTimeout"。
+    //
+    // 为什么换掉链式 setTimeout：
+    //   ① 它和"现在几点""你上次什么时候说话"都无关，进程一重启就从零开始数
+    //      （用户 2026-11-18：「重启了他的计时器也重启了，所以很尴尬」）；
+    //   ② 一次排 45 分钟的 setTimeout 在休眠/时钟跳变下不可靠；
+    //   ③ 轮询天然免疫上面两条 —— 每次醒来只看"排期到点了吗"，与进程活了多久无关。
+    //
+    // 代价：苏醒时间精度变成 ±5 分钟。对"不定时主动聊天"完全够。
+    const POLL_MS = 5 * 60 * 1000;
+    const tick = () => {
+      this.#wakePollTick().catch((error) =>
+        this.log(`✗ 主动苏醒轮询异常：${String(error?.message ?? error)}`),
+      );
     };
-    schedule();
+    // 立刻跑一次：启动/改配置时可能已经有排期到点了，不该再等 5 分钟。
+    tick();
+    this.pollTimer = setInterval(tick, POLL_MS);
+    this.pollTimer.unref?.();
   }
 
   #stopPoller() {
     if (this.pollTimer !== null) {
-      clearTimeout(this.pollTimer);
+      clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
   }
@@ -850,62 +976,291 @@ export class QQCompanionRuntime {
   }
 
   /**
+   * 「这一轮聊完了」—— 让主动苏醒的排期从**现在**重新起算。
+   *
+   * 用户 2026-11-18 提的设计：「在我找你的时候，主动苏醒计时器停止工作，
+   * 等你调用那个结束会话标识的时候，去重新拉起这个计时器」。
+   *
+   * 和"消息到达自动重排"的区别：
+   *   · 自动重排锚在**消息到达**的那一刻；
+   *   · 这个工具锚在**你调用**的那一刻。
+   * 中间隔着你处理并回复的几分钟 —— 所以聊得久的时候，用这个更准。
+   *
+   * 兜底：**不调这个工具也不会永远不醒**。消息到达本来就会重排，
+   * 而且排期到点后还有 `proactiveQuietSec` 之类的闸门把关。
+   *
+   * @param {string} key - `private:<QQ 号>`
+   * @param {string} [note] - 只进日志，方便回查"这句聊完是什么时候标的"
+   * @returns 无损 JSON（不能有 undefined —— DSH 的工具输出校验要求）
+   */
+  endConversation(key, note = '') {
+    const k = String(key ?? '');
+    if (!/^private:\d+$/.test(k)) {
+      return { ok: false, why: '只支持私聊会话（形如 private:12345678）', nextAt: 0, nextInMinutes: 0 };
+    }
+    if (!this.#proactiveKeys().includes(k)) {
+      return {
+        ok: false,
+        why: '这个会话没有配绑定，主动苏醒本来就不会作用于它',
+        nextAt: 0,
+        nextInMinutes: 0,
+      };
+    }
+    const wake = this.effectiveWake(k);
+    if (wake.proactive === false) {
+      return { ok: false, why: '主动苏醒已关闭（wake.proactive = false）', nextAt: 0, nextInMinutes: 0 };
+    }
+
+    this.#reschedule(k, Date.now(), { reason: 'conversation-ended' });
+    const row = this.wakeSchedule.get(k);
+    const nextAt = Number(row?.nextAt) || 0;
+    const nextInMinutes = nextAt > 0 ? Math.max(0, Math.round((nextAt - Date.now()) / 60000)) : 0;
+    this.log(
+      `💤 ${k} 会话结束${note === '' ? '' : `（${note}）`} → 下次主动苏醒在 ${nextInMinutes} 分钟后`,
+    );
+    return { ok: true, why: '', nextAt, nextInMinutes };
+  }
+
+  /**
    * 一次主动苏醒 tick。
    *
-   * 只遍历**绑定的私聊会话**（不是所有见过的会话）—— 主动搭话只发生在确定的主人身上，
-   * 不会跑到随便哪个群里去。用户 2026-10-29：目前只做私聊，群聊不考虑。
-   *
-   * 公开方法（不是 `#private`）：便于单测和手动触发。
+   * 保留为公开方法（不是 `#private`）：便于单测和手动触发 —— 它现在等价于
+   * "对这轮该醒的会话各试一次"，不再自己管时间节奏（节奏交给 #wakePollTick）。
    */
   async proactiveTick() {
-    if (this.config.observeOnly) return;
+    for (const key of this.#proactiveKeys()) {
+      await this.#proactiveAttempt(key, Date.now());
+    }
+  }
 
+  /** 主动苏醒只看**绑定的私聊**（群聊 `qq_*` 都不做，这里更不该往群里跑）。 */
+  #proactiveKeys() {
+    const bindings = Array.isArray(this.config.bindings) ? this.config.bindings : [];
+    const out = [];
+    for (const row of bindings) {
+      const key = String(row?.key ?? '');
+      if (/^private:\d+$/.test(key)) out.push(key);
+    }
+    return out;
+  }
+
+  /**
+   * 5 分钟轮询的主体：只看"排期到点的会话"，没到点的一律不碰。
+   *
+   * 这样"每 5 分钟跑一次"不会变成"每 5 分钟叫一次模型"——绝大多数轮次什么都不做。
+   */
+  async #wakePollTick() {
+    if (this.config.observeOnly) return;
+    // 上一轮还没跑完就跳过：乘号里的 steer 可能卡住，不该叠出第二轮
+    if (this.pollBusy) return;
+    this.pollBusy = true;
+    try {
+      const now = Date.now();
+      for (const key of this.#proactiveKeys()) {
+        const sched = this.wakeSchedule.get(key);
+
+        // 没有排期：首次启动、刚加绑定、或状态被清 —— 现在排一个，不立刻醒。
+        if (sched === undefined) {
+          this.#reschedule(key, now, { reason: 'init' });
+          continue;
+        }
+
+        const wake = this.effectiveWake(key);
+        if (wake.proactive === false) {
+          // 主动苏醒关着：不排期也不触发，等用户打开再重排
+          this.wakeSchedule.delete(key);
+          continue;
+        }
+
+        const plannedMs = Math.max(1000, Number(sched.intervalSec || 0) * 1000);
+        const ratio = this.#overdueRatio(wake);
+        const { due, stale } = evaluateDue(sched.nextAt, now, plannedMs, ratio);
+        if (!due) continue;
+
+        if (stale) {
+          // 过期太久（典型：电脑休眠一夜）→ 不该补醒，直接重排
+          const mins = Math.round((now - sched.nextAt) / 60000);
+          this.log(`⏭ ${key} 排期已过期 ${mins} 分钟（超过 ${ratio}×间隔），不补醒，改为重排`);
+          this.#reschedule(key, now, { reason: 'stale' });
+          continue;
+        }
+
+        await this.#proactiveAttempt(key, now);
+      }
+    } finally {
+      this.pollBusy = false;
+    }
+  }
+
+  /** 对单个会话尝试一次主动苏醒。**无论成败都会重排**，否则会卡死在同一个点。 */
+  async #proactiveAttempt(key, now) {
     // 时段窗口：夜里不主动打扰。有消息唤醒不受这个限制。
     if (!this.#inActiveWindow()) {
       const start = this.config.wake?.activeStartHour ?? 8;
       const end = this.config.wake?.activeEndHour ?? 23;
-      this.log(`🌙 主动苏醒跳过：当前 ${new Date().getHours()} 点，不在 ${start}–${end} 点窗口内`);
+      this.log(`🌙 主动苏醒跳过 ${key}：当前 ${new Date().getHours()} 点，不在 ${start}–${end} 点窗口内`);
+      this.#reschedule(key, now, { reason: 'quiet-window' });
       return;
     }
 
-    const bindings = Array.isArray(this.config.bindings) ? this.config.bindings : [];
-    for (const row of bindings) {
-      const key = String(row?.key ?? '');
-      if (!/^private:\d+$/.test(key)) continue;
-
-      const wake = this.effectiveWake(key);
-      if (wake.proactive === false) continue;
-
-      // 会话正在跑 turn：主动苏醒**不该**插进去。
-      //
-      // 和消息唤醒是有意区别对待的：消息唤醒是主人说话，忙也要送达（那条路径会
-      // 带 busy=true 继续投递）；主动苏醒是它自己找话说，没有紧迫性，打断只会
-      // 干扰主人正在等的事。所以这里直接跳过，等下一轮 —— 不消耗冷却配额。
-      if (this.#isBusy(key)) {
-        this.log(`🌙 主动苏醒跳过 ${key}：会话正在执行任务，不打断`);
-        continue;
-      }
-      // 刚聊过也别插话：#isBusy 挡不住"两个 turn 之间"的空隙（turn/end 一到
-      // busy 就变 false，而对话是密集切换的）。要求"安静够久"才允许主动开口。
-      const quietMs = Math.max(0, Number(wake.proactiveQuietSec ?? 120)) * 1000;
-      const lastAt = this.lastMessageAt.get(key) ?? 0;
-      if (quietMs > 0 && lastAt > 0 && Date.now() - lastAt < quietMs) {
-        const ago = Math.round((Date.now() - lastAt) / 1000);
-        this.log(`🌙 主动苏醒跳过 ${key}：${ago}s 前刚聊过（需静默 ${quietMs / 1000}s）`);
-        continue;
-      }
-
-      const gate = this.#admitWake(key, wake);
-      if (!gate.ok) {
-        // 不静默跳过：用户问「为什么没按我设的间隔醒」时，日志里得看得到原因。
-        this.log(`🌙 主动苏醒跳过 ${key}：${gate.why}`);
-        continue;
-      }
-
-      const unread = this.buffer.unread(key);
-      this.log(`🌙 主动苏醒 ${key}（未读 ${unread.length} 条，本小时第 ${gate.count} 次）`);
-      this.onWake?.({ key, reason: 'proactive', event: null, seq: null });
+    const wake = this.effectiveWake(key);
+    if (wake.proactive === false) {
+      this.wakeSchedule.delete(key);
+      return;
     }
+
+    // 会话正在跑 turn：主动苏醒**不该**插进去。
+    //
+    // 和消息唤醒是有意区别对待的：消息唤醒是主人说话，忙也要送达（那条路径会
+    // 带 busy=true 继续投递）；主动苏醒是它自己找话说，没有紧迫性，打断只会
+    // 干扰主人正在等的事。所以这里直接跳过，等下一轮 —— 不消耗冷却配额。
+    if (this.#isBusy(key)) {
+      this.log(`🌙 主动苏醒跳过 ${key}：会话正在执行任务，不打断`);
+      this.#reschedule(key, now, { reason: 'busy' });
+      return;
+    }
+
+    // 正在 qq_wait_for_messages 里等 → 那就是"还在聊"，不该插话。
+    // （2026-11-18 加的 hasActiveWaiter；即使对话已结束，这条也能挡住长轮询期间的空隙。）
+    if (this.activeWaits.has(key)) {
+      this.log(`🌙 主动苏醒跳过 ${key}：正在 qq_wait_for_messages 里等，不插话`);
+      this.#reschedule(key, now, { reason: 'waiting' });
+      return;
+    }
+
+    // 刚聊过也别插话：#isBusy 挡不住"两个 turn 之间"的空隙（turn/end 一到
+    // busy 就变 false，而对话是密集切换的）。要求"安静够久"才允许主动开口。
+    const quietMs = Math.max(0, Number(wake.proactiveQuietSec ?? 120)) * 1000;
+    const lastAt = this.lastMessageAt.get(key) ?? 0;
+    if (quietMs > 0 && lastAt > 0 && Date.now() - lastAt < quietMs) {
+      const ago = Math.round((Date.now() - lastAt) / 1000);
+      this.log(`🌙 主动苏醒跳过 ${key}：${ago}s 前刚聊过（需静默 ${quietMs / 1000}s）`);
+      this.#reschedule(key, now, { reason: 'recent-chat' });
+      return;
+    }
+
+    const gate = this.#admitWake(key, wake);
+    if (!gate.ok) {
+      // 用户 2026-11-19 明确：被冷却拦住就**丢弃这一次、正常重算下一次**，
+      // 不要为了绕开冷却去篡改间隔。
+      this.log(`🌙 主动苏醒跳过 ${key}：${gate.why} —— 本次丢弃，重排下一次`);
+      this.#reschedule(key, now, { reason: 'cooldown' });
+      return;
+    }
+
+    const unread = this.buffer.unread(key);
+    this.log(`🌙 主动苏醒 ${key}（未读 ${unread.length} 条，本小时第 ${gate.count} 次）`);
+    this.onWake?.({ key, reason: 'proactive', event: null, seq: null });
+    this.#reschedule(key, now, { reason: 'delivered' });
+  }
+
+  /**
+   * 重算并落盘某个会话的下次主动苏醒时间。
+   *
+   * @param {string} key
+   * @param {number} now - 基准时刻（**用"现在"判断是否工作时段**，用户 2026-11-19 拍板）
+   * @param {{ reason?: string }} [options] - 只影响日志和记录，不改变计算
+   */
+  #reschedule(key, now, { reason = 'normal' } = {}) {
+    try {
+      const wake = this.effectiveWake(key);
+      const baseMs = Math.max(10_000, Number(wake.wakeIntervalSec ?? 300) * 1000);
+      const inWork = this.#inWorkNow(wake);
+
+      const { intervalMs, mode, jitterPct } = computeIntervalMs({
+        baseMs,
+        jitterRatio: wake.jitterRatio,
+        workMultiplier: wake.workJitterMultiplier,
+        inWork,
+      });
+
+      // 落在夜间静默窗口里就顺延到窗口结束后第一个整点
+      const nextAt = skipQuietWindow(
+        now + intervalMs,
+        wake.activeStartHour,
+        wake.activeEndHour,
+      );
+
+      this.wakeSchedule.set(key, {
+        nextAt,
+        intervalSec: Math.round(intervalMs / 1000),
+        reason: `${reason}/${mode}`,
+      });
+      // **立即写盘**，不走 #saveState 的 2 秒节流。
+      //
+      // 理由：排期丢了不是"少写一条日志"，而是重启后会按 reason='init' 重排 ——
+      // 等于"从现在起再等 45 分钟"，正是这次改造要消除的行为。
+      // 而且排期变动不频繁（每 40~50 分钟一次），立刻写没有性能顾虑。
+      this.#saveState(true);
+
+      const mins = Math.round((nextAt - now) / 60000);
+      const pct = `${jitterPct >= 0 ? '+' : ''}${Math.round(jitterPct * 100)}%`;
+      this.log(
+        `🗓 ${key} 下次主动苏醒 ${mins} 分钟后` +
+          `（${mode === 'work' ? '工作时段' : '非工作'}，基准 ${Math.round(baseMs / 60000)} 分 ${pct}）`,
+      );
+    } catch (error) {
+      this.log(`✗ 排期计算失败 ${key}：${String(error?.message ?? error)}`);
+    }
+  }
+
+  /** 现在是不是工作时段（用"现在"判断，不看算出来的目标时刻）。 */
+  #inWorkNow(wake) {
+    const spans = parseWorkSpans(wake.workHours).spans;
+    if (spans.length === 0) return false;
+    const calendar = this.workdayCalendar;
+    if (calendar === undefined || calendar === null) return false;
+    try {
+      return calendar.isWorkTime(new Date(), spans).inWork;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 过期判定的倍数（配置坏了要有兜底，不能被一个 NaN 搞成"永不过期"）。 */
+  #overdueRatio(wake) {
+    const n = Number(wake.overdueResetRatio);
+    return Number.isFinite(n) && n >= 1 ? n : 2;
+  }
+
+  /**
+   * 重排**所有**正在参与主动苏醒的会话。
+   *
+   * 用在"排期相关配置改了"的时候：排期是提前算好存起来的绝对时间戳，
+   * 配置改了不重排就等于没改（用户会以为"设置没生效"）。
+   *
+   * @param {string} reason - 只进日志
+   */
+  #rescheduleAll(reason = 'manual') {
+    const now = Date.now();
+    for (const key of this.#proactiveKeys()) {
+      const wake = this.effectiveWake(key);
+      if (wake.proactive === false) {
+        this.wakeSchedule.delete(key);
+        continue;
+      }
+      this.#reschedule(key, now, { reason });
+    }
+    this.log(`↻ 已重排 ${this.wakeSchedule.size} 个会话的主动苏醒（原因：${reason}）`);
+  }
+
+  /**
+   * 主人刚说过话 → 把排期往后推。
+   *
+   * 这是"聊完 10 分钟就被叫醒"的根治办法（2026-11-19 用户实测反馈）。
+   *
+   * 为什么这条不会重踩 2026-11-03 那个坑：
+   *   · 那时错在让**冷却**（minIntervalMs）看 lastWakeAt，结果"越常聊天越不主动"；
+   *   · 这里刷新的是**排期**（nextWakeAt），语义就是"聊完才开始计时"——
+   *     你一直在说话，它就不该主动找你，这本来就是想要的。
+   * 冷却仍然只看 lastProactiveAt，不受消息影响。
+   */
+  #postponeWakeSchedule(key) {
+    const wake = this.effectiveWake(key);
+    if (wake.proactive === false) return;
+    // 只对真正参与主动苏醒的会话生效（绑定的私聊），别给群聊之类的也建条目
+    if (!this.#proactiveKeys().includes(key)) return;
+    this.#reschedule(key, Date.now(), { reason: 'after-message' });
   }
 
   // ── 会话级配置 ───────────────────────────────────────────
@@ -963,9 +1318,31 @@ export class QQCompanionRuntime {
     const windowChanged =
       Number(previous?.wake?.activeStartHour) !== Number(this.config?.wake?.activeStartHour) ||
       Number(previous?.wake?.activeEndHour) !== Number(this.config?.wake?.activeEndHour);
-    if (wakeIntervalChanged || windowChanged) {
+
+    // 排期相关配置（2026-11-19 新增）。任何一个变了都要重排 ——
+    // 排期是"提前算好一个绝对时间戳"存起来的，配置改了不重排就等于没改。
+    const scheduleChanged =
+      String(previous?.wake?.workHours ?? '') !== String(this.config?.wake?.workHours ?? '') ||
+      String(previous?.wake?.workDays ?? '') !== String(this.config?.wake?.workDays ?? '') ||
+      Number(previous?.wake?.jitterRatio) !== Number(this.config?.wake?.jitterRatio) ||
+      Number(previous?.wake?.workJitterMultiplier) !==
+        Number(this.config?.wake?.workJitterMultiplier) ||
+      Number(previous?.wake?.overdueResetRatio) !==
+        Number(this.config?.wake?.overdueResetRatio);
+
+    if (scheduleChanged) {
+      // workDays 是日历对象内部持有的，改了要同步过去（否则节假日判断还用旧规则）
+      this.workdayCalendar?.setWorkDays?.(this.config?.wake?.workDays);
+      this.#rescheduleAll('config');
+    }
+
+    if (wakeIntervalChanged || windowChanged || scheduleChanged) {
+      // 轮询间隔本身是固定的 5 分钟，重建只是为了让"立刻跑一次"发生
       this.#startProactiveTimer();
-      this.log(`↻ 主动苏醒定时器已按新配置重建（间隔 ${Number(this.config?.wake?.wakeIntervalSec ?? 300)}s）`);
+      this.log(
+        `↻ 主动苏醒已按新配置重排（间隔 ${Number(this.config?.wake?.wakeIntervalSec ?? 300)}s` +
+          `${scheduleChanged ? '，排期配置变更' : ''}）`,
+      );
     }
 
     return { config: this.config, reconnecting };

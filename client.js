@@ -221,12 +221,33 @@ window.__ModuleLoader__.load({
         return h('div', { className: 'qqc-page' }, h('div', { className: 'qqc-title' }, 'QQ 伙伴'), h('div', { className: 'qqc-note' }, '正在读取配置…'))
       }
 
-      // 分组：按字段 key 的前缀粗分，避免页面上下一大串没层次。
+      // 分组：按字段 key 分。2026-11-19 重排过一次 —— 原先按前缀粗分，
+      // 把「图片落盘目录」塞进了「连接」，而 selfId/ownerId/bindingSessionId
+      // 三个掉进了"其他"（没有任何 group 匹配它们）。
+      //
+      // ⚠️ **match 必须互斥**：下面的 seen 只用来兜底"其他"分组，不用来
+      // 过滤已渲染的字段。两个 group 同时匹配同一个 key → 那个字段会渲染两遍。
       const groups = [
         { title: '开关', match: (key) => key === 'enabled' || key === 'observeOnly' },
-        { title: '连接', match: (key) => key.startsWith('snowLuma.') || key === 'imageDir' },
-        { title: '唤醒策略', match: (key) => key.startsWith('wake.') || key === 'names' },
-        { title: '会话绑定', match: (key) => key === 'bindings' },
+        // 身份：谁是机器人、谁是主人、怎么叫它
+        {
+          title: '身份',
+          match: (key) => key === 'selfId' || key === 'ownerId' || key === 'names',
+        },
+        { title: '连接', match: (key) => key.startsWith('snowLuma.') },
+        // 会话绑定：消息投到哪个 DSH 会话
+        {
+          title: '会话绑定',
+          match: (key) => key === 'bindings' || key === 'bindingSessionId',
+        },
+        // 消息投递：缓冲期管的是"消息什么时候算定稿"，跟主动苏醒是两件事
+        { title: '消息投递', match: (key) => key === 'wake.bufferSeconds' },
+        // 主动苏醒：间隔、冷却、上限、时段、抖动、工作日
+        {
+          title: '主动苏醒',
+          match: (key) => key.startsWith('wake.') && key !== 'wake.bufferSeconds',
+        },
+        { title: '存储', match: (key) => key === 'imageDir' },
       ]
       // 顶部状态行：连不上协议端时要一眼能看出来（照 MC 那页的做法）。
       const status = payload.status || {}

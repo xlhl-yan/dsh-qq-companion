@@ -400,6 +400,32 @@ const SETTINGS_FIELDS = [
     type: 'number',
     help: '只约束主动苏醒，超过就先歇着。你发的消息不计入、不受限',
   },
+  {
+    key: 'wake.jitterRatio',
+    label: '苏醒抖动幅度',
+    type: 'number',
+    help: '0.15 = 间隔上下浮动 15%。不填按 0.15。填 0 就是死板固定间隔',
+  },
+  {
+    key: 'wake.workJitterMultiplier',
+    label: '工作时段抖动倍数',
+    type: 'number',
+    help:
+      '注意：这是抖动幅度的倍数，不是间隔的倍数。' +
+      '基准 45 分、抖动 15%、倍数 2 时，工作时段间隔 = 45×(1+15%×2) = 58.5 分（取绝对值，只会更长）',
+  },
+  {
+    key: 'wake.workHours',
+    label: '工作时段',
+    type: 'text',
+    help: '形如 09:00-11:30, 13:00-17:30（逗号分隔多个）。留空 = 不区分工作时段',
+  },
+  {
+    key: 'wake.workDays',
+    label: '工作日',
+    type: 'text',
+    help: '1=周一 … 7=周日，逗号分隔。节假日和调休会自动查（联网，失败则只看这里）',
+  },
   { key: 'imageDir', label: '图片落盘目录', type: 'text', help: '留空 = 工作区下的 .qq-companion/images' },
 ];
 
