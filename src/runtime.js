@@ -39,10 +39,20 @@ const DEFAULT_WAKE = {
    */
   activeStartHour: 8,
   activeEndHour: 23,
-  /** 两次唤醒之间至少隔这么久，避免连续小消息把模型叫醒好几次。内部单位是毫秒。 */
-  minIntervalMs: 20000,
-  /** 对外暴露的秒数版本（设置页用秒，好算）。effectiveWake 会用它覆盖 minIntervalMs。 */
-  minIntervalSec: 20,
+  /**
+   * 两次唤醒之间至少隔这么久 —— **2026-11-19 已删除**。
+   *
+   * 删掉的两个理由：
+   *   ① 排期本身已经保证最小间隔（`wakeIntervalSec × (1 - jitterRatio)`），
+   *      冷却纯冗余 —— 45 分钟 × 0.8 = 36 分钟，再怎么拦也轮不到 30 分钟这道闸；
+   *   ② 「冷却拒绝 + 重排」会**死循环** —— 间隔 20 分钟、冷却 30 分钟时，
+   *      每次算出 16~24 分钟、每次被拒、重排出来还是 16~24 分钟 → 永远不醒，
+   *      而且日志里只有"冷却未过"，最难查。
+   *
+   * 保留这个键只为读懂老配置（settings.json 里可能还写着 wake.minIntervalSec），
+   * **没有任何代码读它**。
+   */
+  minIntervalMs: 0,
   /** 每小时最多唤醒几次。超限是**延后**不是丢弃（qq-bridge 的教训）。 */
   maxPerHour: 12,
 
@@ -139,30 +149,22 @@ export class QQCompanionRuntime {
     this.busySessions = new Map();
     /** key -> 该会话的唤醒配置（覆盖全局默认值）。 */
     this.wakeConfigs = new Map();
-    /** key -> 最近一次唤醒时间戳，用于 minIntervalMs 闸门。 */
+    /** key -> 最近一次唤醒时间戳。目前只写不读，留着供以后做展示/诊断。 */
     this.lastWakeAt = new Map();
     /**
-     * key -> 上一次**主动苏醒**的时间戳。
-     *
-     * 必须跟 lastWakeAt 分开：lastWakeAt 会被消息唤醒刷新，如果主动苏醒也拿它算冷却，
-     * 那么"你越常聊天，它越不会主动开口" —— 而且实际间隔会变成设置值的两倍
-     * （2026-11-03 用户实测：设置 30 分钟，实际拖到一小时）。
-     */
-    this.lastProactiveAt = new Map();
-    /**
      * key -> 主动苏醒的**排期**（`{ nextAt, intervalSec, reason }`）。
-     *
-     * 为什么不沿用 `lastProactiveAt + 固定间隔`：那个是"跑完一轮再排下一轮"的
-     * 链式 setTimeout，**进程一重启计时就从头开始**（2026-11-18 用户实测：
-     * 「重启了他的计时器也重启了，所以很尴尬」）。
      *
      * 这里存的是**绝对时间戳**，落盘到 state.json。重启后读回来继续等，
      * 不需要"从零开始数 45 分钟"。
      *
-     * 和 `lastProactiveAt` 的分工：
-     *   · lastProactiveAt —— 冷却用（两次苏醒至少隔 minIntervalMs），**不被消息刷新**
-     *   · wakeSchedule    —— 排期用，**会被"主人最近说话"刷新**（聊完才开始计时）
-     * 两个混用就会重踩 2026-11-03 那个"越聊天越不主动"的坑。
+     * 它取代了两样东西：
+     *   · 旧的"上次苏醒时间 + 固定间隔"链式计时（重启就归零）；
+     *   · 旧的冷却 `minIntervalSec`（2026-11-19 删除 —— 排期已保证间隔，
+     *     而且"拒绝后重排"会死循环）。
+     *
+     * **会被"主人最近说话"刷新**（聊完才开始计时）。这和 2026-11-03 那个
+     * "越聊天越不主动"的坑不是同一件事：那时被刷新的是**冷却**，
+     * 而冷却在语义上就不该被消息影响。
      */
     this.wakeSchedule = new Map();
 
@@ -877,13 +879,13 @@ export class QQCompanionRuntime {
    *
    * 两类唤醒的经济学完全不同，所以拆开算：
    *
-   * - **消息唤醒**（`messageWake: true`）：**冷却和小时上限都不生效**。
+   * - **消息唤醒**（`messageWake: true`）：**任何限流都不生效**。
    *   人来找你，就该立刻回；连发刷屏早被缓冲期（debounce）合并成一次了，
-   *   再拿冷却/上限去挡，只会让用户觉得"它坏了"
+   *   再拿上限去挡，只会让用户觉得"它坏了"
    *   （2026-10-29 用户实测「我的消息也被唤醒间隔限制了？这不对吧」）。
    *
-   * - **主动苏醒**（不传）：冷却 + 每小时上限**都生效**。这是 AI 自己找话说，
-   *   跟别人说话撞车了等一等、或者今天次数用完了就先歇着，都合理。
+   * - **主动苏醒**（不传）：只剩**每小时上限**。
+   *   冷却已于 2026-11-19 删除（排期本身保证间隔，而且"拒绝后重排"会死循环）。
    */
   #admitWake(key, wake, options = {}) {
     const now = Date.now();
@@ -897,20 +899,22 @@ export class QQCompanionRuntime {
       return { ok: true, count: history.length };
     }
 
-    // 主动苏醒：冷却 + 小时上限。
-    // 冷却看 lastProactiveAt（上次主动苏醒），**不是** lastWakeAt —— 后者会被消息刷新。
-    const last = this.lastProactiveAt.get(key) ?? 0;
-    if (now - last < wake.minIntervalMs) {
-      const wait = Math.round((wake.minIntervalMs - (now - last)) / 1000);
-      return { ok: false, why: `距上次主动苏醒不足 ${Math.round(wake.minIntervalMs / 1000)}s（还差 ${wait}s）` };
-    }
+    // 主动苏醒：只剩**每小时上限**这一道闸。
+    //
+    // 冷却（minIntervalSec）2026-11-19 用户拍板删掉：
+    //   · 排期本身已经保证最小间隔（间隔 × (1 - jitter)），冷却纯冗余
+    //     —— 45 分钟 × 0.8 = 36 分钟，冷却是 30 分钟，永远撞不上；
+    //   · 更糟的是「拒绝后重排」会**死循环**：间隔 20 分钟、冷却 30 分钟时，
+    //     每次算出 16~24 分钟、每次被拒、重排出来还是 16~24 分钟 → 永远不醒。
+    //     而这种失败是静默的（日志只有"冷却未过"），最难查。
+    //
+    // 保留的这道上限是**温和的保险丝**：一小时窗口自然滚动，不会永久卡死。
     if (history.length >= wake.maxPerHour) {
       return { ok: false, why: `本小时主动苏醒已达上限 ${wake.maxPerHour} 次` };
     }
     history.push(now);
     this.wakeHistory.set(key, history);
     this.lastWakeAt.set(key, now);
-    this.lastProactiveAt.set(key, now);
     return { ok: true, count: history.length };
   }
 
@@ -1250,10 +1254,11 @@ export class QQCompanionRuntime {
    * 这是"聊完 10 分钟就被叫醒"的根治办法（2026-11-19 用户实测反馈）。
    *
    * 为什么这条不会重踩 2026-11-03 那个坑：
-   *   · 那时错在让**冷却**（minIntervalMs）看 lastWakeAt，结果"越常聊天越不主动"；
-   *   · 这里刷新的是**排期**（nextWakeAt），语义就是"聊完才开始计时"——
-   *     你一直在说话，它就不该主动找你，这本来就是想要的。
-   * 冷却仍然只看 lastProactiveAt，不受消息影响。
+   *   · 那时错在让**冷却**去看 lastWakeAt（那个会被消息刷新），结果"越常聊天越不主动"；
+   *   · 这里刷新的是**排期**，语义就是"聊完才开始计时"——你一直在说话，
+   *     它就不该主动找你，这本来就是想要的。
+   * 语义上的区别：**冷却**问的是"两次苏醒隔够久了吗"，**排期**问的是"下次该什么时候醒"。
+   * 前者的答案不该受你说话影响，后者正该受影响。
    */
   #postponeWakeSchedule(key) {
     const wake = this.effectiveWake(key);
@@ -1268,14 +1273,6 @@ export class QQCompanionRuntime {
   effectiveWake(key) {
     const scoped = { ...(this.config.wake ?? {}), ...(this.wakeConfigs.get(key) ?? {}) };
     const merged = { ...DEFAULT_WAKE, ...scoped };
-    // 对外用秒（minIntervalSec），内部统一按毫秒算 —— 设置页填 20 比填 20000 好理解。
-    // ⚠️ 只有**显式**写了 minIntervalSec 才覆盖 minIntervalMs：否则 DEFAULT_WAKE 里
-    // 那个默认秒值会把用户老配置里的 minIntervalMs（如 8000）盖成 20000。
-    if (scoped.minIntervalSec !== undefined) {
-      const sec = Number(scoped.minIntervalSec);
-      if (Number.isFinite(sec) && sec >= 0) merged.minIntervalMs = Math.round(sec * 1000);
-    }
-    if (!Number.isFinite(Number(merged.minIntervalMs))) merged.minIntervalMs = DEFAULT_WAKE.minIntervalMs;
     // 顶层 ownerId 注入进来：wake.js 只认 wake.ownerId。
     if (merged.ownerId === undefined) merged.ownerId = this.config.ownerId ?? '';
     return merged;

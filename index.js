@@ -388,12 +388,9 @@ const SETTINGS_FIELDS = [
     type: 'number',
     help: '24 小时制。默认 23 点之后不再主动；起始大于截止表示跨午夜（22→6）',
   },
-  {
-    key: 'wake.minIntervalSec',
-    label: '主动苏醒冷却（秒）',
-    type: 'number',
-    help: '只约束主动苏醒。你发的消息不受影响 —— 连发已被缓冲期合并，不会刷屏',
-  },
+  // 冷却（wake.minIntervalSec）2026-11-19 删除：
+  //   排期本身保证最小间隔，冷却纯冗余；而且"拒绝后重排"会死循环
+  //   （间隔 20 分钟 + 冷却 30 分钟 = 永远不醒，且日志只有"冷却未过"）。
   {
     key: 'wake.maxPerHour',
     label: '主动苏醒每小时上限',
