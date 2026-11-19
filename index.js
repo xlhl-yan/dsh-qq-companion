@@ -431,6 +431,15 @@ const SETTINGS_FIELDS = [
       'qq_wait_for_messages 连续超时几次、一点回应都没有，就当作这一段聊完了，' +
       '主动苏醒计时从那一刻重排。拿到消息就清零。不填按 2',
   },
+  {
+    key: 'wake.overdueResetRatio',
+    label: '过期容限倍数',
+    type: 'number',
+    help:
+      '关机/休眠后，排期过期超过「苏醒间隔 × 这个倍数」就不补醒、直接重排。' +
+      '默认 2 —— 间隔 45 分钟时容限 90 分钟：合盖一小时会补醒，关机一夜不会。' +
+      '填 0.1 就几乎从不补醒，填 12 是 9 小时（45×12），填 24 是 18 小时',
+  },
   { key: 'imageDir', label: '图片落盘目录', type: 'text', help: '留空 = 工作区下的 .qq-companion/images' },
 ];
 

@@ -147,6 +147,10 @@ function clampHour(value, fallback) {
 export function evaluateDue(nextAt, now, intervalMs, ratio = 2) {
   if (now < nextAt) return { due: false, stale: false };
   const overdue = now - nextAt;
-  const cap = Math.max(60_000, intervalMs * Math.max(1, ratio));
+  // 下限 0.01 而不是 1：`ratio < 1` 是有意义的配置（"只允许很小的逾期"），
+  // 2026-11-19 之前写成 Math.max(1, ratio)，把 0.5 悄悄抬成 1 —— 用户按
+  // 0.5 调完发现行为没变，很难理解。真正要防的是 0（cap=0，任何逾期都 stale）
+  // 和负数。
+  const cap = Math.max(60_000, intervalMs * Math.max(0.01, ratio));
   return { due: true, stale: overdue > cap };
 }

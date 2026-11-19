@@ -1100,15 +1100,24 @@ export class QQCompanionRuntime {
           continue;
         }
 
-        const plannedMs = Math.max(1000, Number(sched.intervalSec || 0) * 1000);
+        // 容限基数用**配置里的间隔**，不是排期时那个抖动后的值。
+        //
+        // 用 `sched.intervalSec`（含 ±jitter 的实际值）的话，用户设 12 得到的
+        // 容限会在 9 ~ 10.8 小时之间飘 —— 同样的配置每次算出来不一样，
+        // 问"为什么是 9 小时不是 9.8"时没法解释。用配置值就永远是
+        // 45 × 12 = 9 小时，可预期。
+        const baseMs = Math.max(60_000, Number(wake.wakeIntervalSec ?? 300) * 1000);
         const ratio = this.#overdueRatio(wake);
-        const { due, stale } = evaluateDue(sched.nextAt, now, plannedMs, ratio);
+        const { due, stale } = evaluateDue(sched.nextAt, now, baseMs, ratio);
         if (!due) continue;
 
         if (stale) {
           // 过期太久（典型：电脑休眠一夜）→ 不该补醒，直接重排
           const mins = Math.round((now - sched.nextAt) / 60000);
-          this.log(`⏭ ${key} 排期已过期 ${mins} 分钟（超过 ${ratio}×间隔），不补醒，改为重排`);
+          const graceMins = Math.round((baseMs * ratio) / 60000);
+          this.log(
+            `⏭ ${key} 排期已过期 ${mins} 分钟（容限 ${graceMins} 分钟 = 间隔 ${Math.round(baseMs / 60000)} 分 × ${ratio}），不补醒，改为重排`,
+          );
           this.#reschedule(key, now, { reason: 'stale' });
           continue;
         }
@@ -1307,9 +1316,15 @@ export class QQCompanionRuntime {
   }
 
   /** 过期判定的倍数（配置坏了要有兜底，不能被一个 NaN 搞成"永不过期"）。 */
+  /**
+   * 过期容限倍数：超过「间隔 × 这个值」就不补醒。
+   *
+   * 允许小于 1（0.1 表示"几乎从不补醒"）；0 或负数按默认 2 处理 ——
+   * 0 会让容限变成 0，"任何逾期都 stale"，那行为和"从不补醒"一样但语义混乱。
+   */
   #overdueRatio(wake) {
     const n = Number(wake.overdueResetRatio);
-    return Number.isFinite(n) && n >= 1 ? n : 2;
+    return Number.isFinite(n) && n > 0 ? n : 2;
   }
 
   /**
