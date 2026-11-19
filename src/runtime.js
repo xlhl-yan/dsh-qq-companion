@@ -87,14 +87,6 @@ const DEFAULT_WAKE = {
    * 场景：电脑休眠一夜，醒来时排期已经过期 8 小时 —— 不该早上一开机就被叫。
    */
   overdueResetRatio: 2,
-  /**
-   * `qq_wait_for_messages` **连续空等**几次就算"这一段聊完了"。
-   *
-   * 用户 2026-11-19 定的：**超时两次之后默认结束会话**。
-   * 拿到消息会清零，所以只有"连续几次都等到超时、一点回应都没有"才触发。
-   * 触发后等价于调了一次 `qq_end_conversation`：主动苏醒计时从此刻重排。
-   */
-  waitTimeoutsBeforeEnd: 2,
 };
 
 /**
@@ -213,15 +205,6 @@ export class QQCompanionRuntime {
     this.wakeHistory = new Map();
     /** 等待新消息的长轮询挂起点。 */
     this.waiters = new Set();
-    /**
-     * key -> `qq_wait_for_messages` **连续空等**的次数。
-     *
-     * 用户 2026-11-19：**超时两次之后默认结束会话**。
-     * 拿到消息就清零（对方还在说）；只有"超时且没拿到任何消息"才 +1。
-     *
-     * 不持久化：重启丢了只是要多等两次，没有正确性问题。
-     */
-    this.waitTimeouts = new Map();
 
     this.endpoint = null;
     this.client = null;
@@ -412,10 +395,6 @@ export class QQCompanionRuntime {
     // 刚静下来 10 分钟，然后被主动唤醒重新拉起了会话」—— 因为那时排期是
     // 按"上次苏醒 + 固定间隔"算的，跟你什么时候说完话完全无关。
     this.#postponeWakeSchedule(conv.key);
-
-    // 有人说话 = 对方还在聊 → 清掉"连续空等"的计数。
-    // 不然「上次聊到一半超时两次」的陈年计数会带到这次对话里。
-    this.waitTimeouts.delete(conv.key);
 
     // ⚠️ 如果有长轮询在等，这条消息**已经直接交给它了** —— agent 会带着这批消息
     // 在同一次工具调用里继续跑。此时再安排缓冲期唤醒 = 把同一批消息叫醒两次，
@@ -1001,55 +980,6 @@ export class QQCompanionRuntime {
   }
 
   /**
-   * 「这一轮聊完了」—— 让主动苏醒的排期从**现在**重新起算。
-   *
-   * 用户 2026-11-18 提的设计：「在我找你的时候，主动苏醒计时器停止工作，
-   * 等你调用那个结束会话标识的时候，去重新拉起这个计时器」。
-   *
-   * 和"消息到达自动重排"的区别：
-   *   · 自动重排锚在**消息到达**的那一刻；
-   *   · 这个工具锚在**你调用**的那一刻。
-   * 中间隔着你处理并回复的几分钟 —— 所以聊得久的时候，用这个更准。
-   *
-   * 兜底：**不调这个工具也不会永远不醒**。消息到达本来就会重排，
-   * 而且排期到点后还有 `proactiveQuietSec` 之类的闸门把关。
-   *
-   * @param {string} key - `private:<QQ 号>`
-   * @param {string} [note] - 只进日志，方便回查"这句聊完是什么时候标的"
-   * @returns 无损 JSON（不能有 undefined —— DSH 的工具输出校验要求）
-   */
-  endConversation(key, note = '') {
-    const k = String(key ?? '');
-    if (!/^private:\d+$/.test(k)) {
-      return { ok: false, why: '只支持私聊会话（形如 private:12345678）', nextAt: 0, nextInMinutes: 0 };
-    }
-    if (!this.#proactiveKeys().includes(k)) {
-      return {
-        ok: false,
-        why: '这个会话没有配绑定，主动苏醒本来就不会作用于它',
-        nextAt: 0,
-        nextInMinutes: 0,
-      };
-    }
-    const wake = this.effectiveWake(k);
-    if (wake.proactive === false) {
-      return { ok: false, why: '主动苏醒已关闭（wake.proactive = false）', nextAt: 0, nextInMinutes: 0 };
-    }
-
-    // 显式结束 → 连续空等的计数没有意义了（这一段已经正式收尾）
-    this.waitTimeouts.delete(k);
-
-    this.#reschedule(k, Date.now(), { reason: 'conversation-ended' });
-    const row = this.wakeSchedule.get(k);
-    const nextAt = Number(row?.nextAt) || 0;
-    const nextInMinutes = nextAt > 0 ? Math.max(0, Math.round((nextAt - Date.now()) / 60000)) : 0;
-    this.log(
-      `💤 ${k} 会话结束${note === '' ? '' : `（${note}）`} → 下次主动苏醒在 ${nextInMinutes} 分钟后`,
-    );
-    return { ok: true, why: '', nextAt, nextInMinutes };
-  }
-
-  /**
    * 一次主动苏醒 tick。
    *
    * 保留为公开方法（不是 `#private`）：便于单测和手动触发 —— 它现在等价于
@@ -1150,10 +1080,18 @@ export class QQCompanionRuntime {
     //
     // 和消息唤醒是有意区别对待的：消息唤醒是主人说话，忙也要送达（那条路径会
     // 带 busy=true 继续投递）；主动苏醒是它自己找话说，没有紧迫性，打断只会
-    // 干扰主人正在等的事。所以这里直接跳过，等下一轮 —— 不消耗冷却配额。
+    // 干扰主人正在等的事。
+    //
+    // **不重排**（2026-11-19 用户拍板）：turn 结束后 `turn/end` 会重排，
+    // 锚点在那里。这里如果也重排，锚点就变成"撞上 busy 的那一刻" ——
+    // 聊得越久偏得越多（22:00 撞上 → 22:45 又撞 → 23:30，最后被静默窗口
+    // 推到明早 9 点，看起来像"整夜不醒"）。
+    //
+    // 排期不动会一直 due，每 5 分钟再来看一眼 —— 这就够了。
+    // 万一 busy 持续太久（超过过期容限），#wakePollTick 的 stale 分支
+    // 会兜住并重排，不会永久卡着。
     if (this.#isBusy(key)) {
-      this.log(`🌙 主动苏醒跳过 ${key}：会话正在执行任务，不打断`);
-      this.#reschedule(key, now, { reason: 'busy' });
+      this.log(`🌙 主动苏醒跳过 ${key}：会话正在执行任务，不打断（排期不动，等 turn/end 重排）`);
       return;
     }
 
@@ -1189,61 +1127,6 @@ export class QQCompanionRuntime {
     this.log(`🌙 主动苏醒 ${key}（未读 ${unread.length} 条，本小时第 ${gate.count} 次）`);
     this.onWake?.({ key, reason: 'proactive', event: null, seq: null });
     this.#reschedule(key, now, { reason: 'delivered' });
-  }
-
-  /**
-   * 记录一次 `qq_wait_for_messages` 的结果，连续空等够次数就当作"这一段聊完了"。
-   *
-   * 用户 2026-11-19 定的规则：**wait 超时两次之后默认结束会话**。
-   *
-   * 为什么需要它：`qq_end_conversation` 靠 Agent 主动调，而它有时候会忘（或者在
-   * 长任务里顾不上）。没有兜底的话，排期就停在"最后一条消息 + 间隔"上 ——
-   * 这个其实不会卡死（消息到达本来就会重排），但**聊得久的时候计时会偏早**。
-   * 连续两次空等是很强的信号："对方确实不说了"。
-   *
-   * 什么算"空等"：`timeout === true` **且没有拿到任何消息**。
-   * 超时但拿到了消息（比如"再等一轮"期间来了消息）说明对方还在说，不算。
-   *
-   * @param {string} key
-   * @param {{ timeout?: boolean, messages?: unknown[] }} value - wait 的返回值
-   */
-  #trackWaitOutcome(key, value) {
-    const gotMessages = Array.isArray(value?.messages) && value.messages.length > 0;
-
-    // 拿到消息 = 对方还在说话 → 计数清零
-    if (gotMessages) {
-      if (this.waitTimeouts.delete(key)) {
-        this.log(`⏱ ${key} wait 拿到消息，连续空等计数清零`);
-      }
-      return;
-    }
-
-    // 不是超时（比如 runtime 停止导致的 resolve）→ 不计数
-    if (value?.timeout !== true) return;
-
-    const next = (this.waitTimeouts.get(key) ?? 0) + 1;
-    this.waitTimeouts.set(key, next);
-
-    const limit = this.#waitTimeoutLimit(key);
-    if (next < limit) {
-      this.log(`⏱ ${key} wait 空等第 ${next}/${limit} 次`);
-      return;
-    }
-
-    this.waitTimeouts.delete(key);
-    this.log(`⏱ ${key} wait 连续空等 ${next} 次 → 默认这一段聊完了，重排主动苏醒`);
-    this.#postponeWakeSchedule(key);
-  }
-
-  /**
-   * 连续空等多少次算聊完。配置坏了兜底到 2（用户 2026-11-19 定的值）。
-   *
-   * 传 key 而不是空串：`effectiveWake` 会合并**会话级**配置，
-   * 传空串就拿不到 per-key 的覆盖值了。
-   */
-  #waitTimeoutLimit(key) {
-    const n = Number(this.effectiveWake(key).waitTimeoutsBeforeEnd ?? 2);
-    return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : 2;
   }
 
   /**
@@ -1366,6 +1249,47 @@ export class QQCompanionRuntime {
     // 只对真正参与主动苏醒的会话生效（绑定的私聊），别给群聊之类的也建条目
     if (!this.#proactiveKeys().includes(key)) return;
     this.#reschedule(key, Date.now(), { reason: 'after-message' });
+  }
+
+  /**
+   * 某个 DSH 会话的一轮对话结束了 → 把对应 QQ 会话的排期从**现在**重算。
+   *
+   * 这是主动苏醒的**主锚点**（2026-11-19 用户拍板）。
+   *
+   * **为什么锚在 turn/end 而不是 turn/start**：
+   *   · turn/start 是"主人刚开口"，从那一刻算 45 分钟。要是这一轮聊了 30 分钟，
+   *     排期就会在你聊完 15 分钟后到点 —— 又要来打扰。
+   *   · turn/end 是"这一轮真的结束了"，锚点才落在正确的地方。
+   *
+   * **为什么它取代了两个机制**：
+   *   · `qq_end_conversation` 工具 —— 靠 Agent 记得调
+   *   · wait 连续空等两次兜底 —— 靠"等不到回应"来推断
+   * 这个不需要谁记得，每轮对话结束必然发生一次。
+   *
+   * **Web 上也生效**：`session/event` 的 turn/end 在 QQ 和 Web 两条通道都会发，
+   * 所以"在 Web 上聊完"同样会让 QQ 的排期重新计时 —— 这正是之前
+   * "Web 聊完就再也不主动醒"那个设计缺陷的修法。
+   *
+   * @param {string} sessionId - DSH 会话 id
+   * @returns {number} 重排了几个绑定的 QQ 会话（0 = 这个会话没绑 QQ）
+   */
+  noteTurnEnd(sessionId) {
+    const id = String(sessionId ?? '');
+    if (id === '') return 0;
+
+    let touched = 0;
+    const now = Date.now();
+    for (const row of Array.isArray(this.config.bindings) ? this.config.bindings : []) {
+      const key = String(row?.key ?? '');
+      if (!/^private:\d+$/.test(key)) continue;
+      if (String(row?.sessionId ?? '').trim() !== id) continue;
+      // 主动苏醒关着就不建排期（等开关打开时 #wakePollTick 会 init 一个）
+      if (this.effectiveWake(key).proactive === false) continue;
+      this.#reschedule(key, now, { reason: 'turn-end' });
+      touched += 1;
+    }
+    // 没绑定就不吭声：绝大多数会话（Lead、其他项目）都不该在这里刷日志
+    return touched;
   }
 
   // ── 会话级配置 ───────────────────────────────────────────
@@ -1693,10 +1617,6 @@ export class QQCompanionRuntime {
       // 下次唤醒报的是 ready 长度，不会再把它们算成"新消息"。
       this.buffer.markDelivered(key, existing.map((r) => r.seq));
       this.#saveState();
-      // 立即返回这条路径**不经过 waiter.resolve**，所以清零要在这里做。
-      // 漏掉的话"连续空等"的计数就不会因为拿到消息而重置 ——
-      // 一旦攒够两次，会在明明还在聊的时候误判成"聊完了"。
-      this.waitTimeouts.delete(key);
       return Promise.resolve({ ok: true, immediate: true, messages: existing.map(toView) });
     }
 
@@ -1718,7 +1638,6 @@ export class QQCompanionRuntime {
             this.buffer.markDelivered(key, seqs);
             this.#saveState();
           }
-          this.#trackWaitOutcome(key, value);
           resolve(value);
         },
       };

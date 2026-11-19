@@ -425,41 +425,9 @@ export function createQQTools(runtime) {
         return { ok: true, key, ...info };
       },
     },
-    {
-      name: 'qq_end_conversation',
-      description:
-        '告诉插件「这一轮聊完了」，让主动苏醒的计时**从现在**重新开始。' +
-        '不调用也不会永远不醒（消息到达本身就会重排），但聊得久的时候用它能更准 —— ' +
-        '否则计时是从你收到消息那一刻算起的，可能在你刚说完话没多久就又来找你。' +
-        '只对配了绑定的私聊会话有效。',
-      parameters: {
-        type: 'object',
-        properties: {
-          key: { type: 'string', description: KEY_DESCRIPTION },
-          note: { type: 'string', description: '一句话备注，只进日志，方便回查什么时候标的。' },
-        },
-        required: ['key'],
-      },
-      output: {
-        schema: {
-          type: 'object',
-          properties: {
-            ok: { type: 'boolean' },
-            why: { type: 'string' },
-            nextAt: { type: 'number' },
-            nextInMinutes: { type: 'number' },
-          },
-        },
-        render: renderJson,
-      },
-      async execute(args) {
-        // 注意：为什么落在这条而不是别处 —— 它只改排期，不动消息队列、不动已读水位。
-        // "聊完了"跟"消息读完了"是两件事，工具分开、语义分开。
-        return runtime.endConversation(
-          String(args?.key ?? '').trim(),
-          String(args?.note ?? '').trim(),
-        );
-      },
-    },
+    // qq_end_conversation 已删除（2026-11-19 用户拍板）：
+    // 主动苏醒的排期现在由 session/event 的 turn/end 自动重排 —— 每轮对话
+    // 结束必然发生一次，不需要 Agent 记得调。留着一个"永远不会被触发所以
+    // 看不出对错"的工具，比删掉更危险。
   ];
 }

@@ -203,6 +203,17 @@ export function apply(ctx, config = {}) {
       } else if (type === 'turn/end') {
         runtime.setSessionBusy(sessionId, false);
         runtime.flushPending(sessionId);
+        // 一轮对话真的结束了 → 主动苏醒的排期从这一刻重算。
+        //
+        // 这是**主锚点**（2026-11-19 用户拍板）。QQ 和 Web 两条通道的 turn/end
+        // 都会走到这里，所以"在 Web 上聊完"也会让 QQ 的主动苏醒重新计时 ——
+        // 修掉了「Web 聊完 → 排期锚在两次 busy 之间 → 整夜不醒」那个缺陷。
+        //
+        // 它取代了 qq_end_conversation 工具和 wait 空等兜底（都已删除）。
+        const rebased = runtime.noteTurnEnd(sessionId);
+        if (rebased > 0) {
+          say(`↻ 会话结束，已重排 ${rebased} 个 QQ 会话的主动苏醒`);
+        }
       }
     } catch (error) {
       say(`✗ 忙闲判定异常：${String(error?.message ?? error)}`);
@@ -423,14 +434,8 @@ const SETTINGS_FIELDS = [
     type: 'text',
     help: '1=周一 … 7=周日，逗号分隔。节假日和调休会自动查（联网，失败则只看这里）',
   },
-  {
-    key: 'wake.waitTimeoutsBeforeEnd',
-    label: '空等几次算聊完',
-    type: 'number',
-    help:
-      'qq_wait_for_messages 连续超时几次、一点回应都没有，就当作这一段聊完了，' +
-      '主动苏醒计时从那一刻重排。拿到消息就清零。不填按 2',
-  },
+  // 曾经的「空等几次算聊完」（wake.waitTimeoutsBeforeEnd）已删除：
+  // 排期现在由 turn/end 自动重排，不需要靠"等不到回应"去推断。
   {
     key: 'wake.overdueResetRatio',
     label: '过期容限倍数',
