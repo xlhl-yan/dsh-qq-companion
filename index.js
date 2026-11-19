@@ -423,6 +423,14 @@ const SETTINGS_FIELDS = [
     type: 'text',
     help: '1=周一 … 7=周日，逗号分隔。节假日和调休会自动查（联网，失败则只看这里）',
   },
+  {
+    key: 'wake.waitTimeoutsBeforeEnd',
+    label: '空等几次算聊完',
+    type: 'number',
+    help:
+      'qq_wait_for_messages 连续超时几次、一点回应都没有，就当作这一段聊完了，' +
+      '主动苏醒计时从那一刻重排。拿到消息就清零。不填按 2',
+  },
   { key: 'imageDir', label: '图片落盘目录', type: 'text', help: '留空 = 工作区下的 .qq-companion/images' },
 ];
 

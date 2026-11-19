@@ -87,6 +87,14 @@ const DEFAULT_WAKE = {
    * 场景：电脑休眠一夜，醒来时排期已经过期 8 小时 —— 不该早上一开机就被叫。
    */
   overdueResetRatio: 2,
+  /**
+   * `qq_wait_for_messages` **连续空等**几次就算"这一段聊完了"。
+   *
+   * 用户 2026-11-19 定的：**超时两次之后默认结束会话**。
+   * 拿到消息会清零，所以只有"连续几次都等到超时、一点回应都没有"才触发。
+   * 触发后等价于调了一次 `qq_end_conversation`：主动苏醒计时从此刻重排。
+   */
+  waitTimeoutsBeforeEnd: 2,
 };
 
 /**
@@ -205,6 +213,15 @@ export class QQCompanionRuntime {
     this.wakeHistory = new Map();
     /** 等待新消息的长轮询挂起点。 */
     this.waiters = new Set();
+    /**
+     * key -> `qq_wait_for_messages` **连续空等**的次数。
+     *
+     * 用户 2026-11-19：**超时两次之后默认结束会话**。
+     * 拿到消息就清零（对方还在说）；只有"超时且没拿到任何消息"才 +1。
+     *
+     * 不持久化：重启丢了只是要多等两次，没有正确性问题。
+     */
+    this.waitTimeouts = new Map();
 
     this.endpoint = null;
     this.client = null;
@@ -395,6 +412,10 @@ export class QQCompanionRuntime {
     // 刚静下来 10 分钟，然后被主动唤醒重新拉起了会话」—— 因为那时排期是
     // 按"上次苏醒 + 固定间隔"算的，跟你什么时候说完话完全无关。
     this.#postponeWakeSchedule(conv.key);
+
+    // 有人说话 = 对方还在聊 → 清掉"连续空等"的计数。
+    // 不然「上次聊到一半超时两次」的陈年计数会带到这次对话里。
+    this.waitTimeouts.delete(conv.key);
 
     // ⚠️ 如果有长轮询在等，这条消息**已经直接交给它了** —— agent 会带着这批消息
     // 在同一次工具调用里继续跑。此时再安排缓冲期唤醒 = 把同一批消息叫醒两次，
@@ -1015,6 +1036,9 @@ export class QQCompanionRuntime {
       return { ok: false, why: '主动苏醒已关闭（wake.proactive = false）', nextAt: 0, nextInMinutes: 0 };
     }
 
+    // 显式结束 → 连续空等的计数没有意义了（这一段已经正式收尾）
+    this.waitTimeouts.delete(k);
+
     this.#reschedule(k, Date.now(), { reason: 'conversation-ended' });
     const row = this.wakeSchedule.get(k);
     const nextAt = Number(row?.nextAt) || 0;
@@ -1156,6 +1180,61 @@ export class QQCompanionRuntime {
     this.log(`🌙 主动苏醒 ${key}（未读 ${unread.length} 条，本小时第 ${gate.count} 次）`);
     this.onWake?.({ key, reason: 'proactive', event: null, seq: null });
     this.#reschedule(key, now, { reason: 'delivered' });
+  }
+
+  /**
+   * 记录一次 `qq_wait_for_messages` 的结果，连续空等够次数就当作"这一段聊完了"。
+   *
+   * 用户 2026-11-19 定的规则：**wait 超时两次之后默认结束会话**。
+   *
+   * 为什么需要它：`qq_end_conversation` 靠 Agent 主动调，而它有时候会忘（或者在
+   * 长任务里顾不上）。没有兜底的话，排期就停在"最后一条消息 + 间隔"上 ——
+   * 这个其实不会卡死（消息到达本来就会重排），但**聊得久的时候计时会偏早**。
+   * 连续两次空等是很强的信号："对方确实不说了"。
+   *
+   * 什么算"空等"：`timeout === true` **且没有拿到任何消息**。
+   * 超时但拿到了消息（比如"再等一轮"期间来了消息）说明对方还在说，不算。
+   *
+   * @param {string} key
+   * @param {{ timeout?: boolean, messages?: unknown[] }} value - wait 的返回值
+   */
+  #trackWaitOutcome(key, value) {
+    const gotMessages = Array.isArray(value?.messages) && value.messages.length > 0;
+
+    // 拿到消息 = 对方还在说话 → 计数清零
+    if (gotMessages) {
+      if (this.waitTimeouts.delete(key)) {
+        this.log(`⏱ ${key} wait 拿到消息，连续空等计数清零`);
+      }
+      return;
+    }
+
+    // 不是超时（比如 runtime 停止导致的 resolve）→ 不计数
+    if (value?.timeout !== true) return;
+
+    const next = (this.waitTimeouts.get(key) ?? 0) + 1;
+    this.waitTimeouts.set(key, next);
+
+    const limit = this.#waitTimeoutLimit(key);
+    if (next < limit) {
+      this.log(`⏱ ${key} wait 空等第 ${next}/${limit} 次`);
+      return;
+    }
+
+    this.waitTimeouts.delete(key);
+    this.log(`⏱ ${key} wait 连续空等 ${next} 次 → 默认这一段聊完了，重排主动苏醒`);
+    this.#postponeWakeSchedule(key);
+  }
+
+  /**
+   * 连续空等多少次算聊完。配置坏了兜底到 2（用户 2026-11-19 定的值）。
+   *
+   * 传 key 而不是空串：`effectiveWake` 会合并**会话级**配置，
+   * 传空串就拿不到 per-key 的覆盖值了。
+   */
+  #waitTimeoutLimit(key) {
+    const n = Number(this.effectiveWake(key).waitTimeoutsBeforeEnd ?? 2);
+    return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : 2;
   }
 
   /**
@@ -1599,6 +1678,10 @@ export class QQCompanionRuntime {
       // 下次唤醒报的是 ready 长度，不会再把它们算成"新消息"。
       this.buffer.markDelivered(key, existing.map((r) => r.seq));
       this.#saveState();
+      // 立即返回这条路径**不经过 waiter.resolve**，所以清零要在这里做。
+      // 漏掉的话"连续空等"的计数就不会因为拿到消息而重置 ——
+      // 一旦攒够两次，会在明明还在聊的时候误判成"聊完了"。
+      this.waitTimeouts.delete(key);
       return Promise.resolve({ ok: true, immediate: true, messages: existing.map(toView) });
     }
 
@@ -1620,6 +1703,7 @@ export class QQCompanionRuntime {
             this.buffer.markDelivered(key, seqs);
             this.#saveState();
           }
+          this.#trackWaitOutcome(key, value);
           resolve(value);
         },
       };
