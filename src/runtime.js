@@ -386,15 +386,16 @@ export class QQCompanionRuntime {
 
     if (this.config.observeOnly) return;
 
-    // 有人说话 → 主动苏醒的排期往后推。
+    // 消息到达**不做任何排期动作**（2026-11-19 下午删除那一步）。
     //
-    // 放在 satisfiedWaiters 判断**之前**：不管这条消息最终是走 wait 直接交付、
-    // 还是走缓冲期唤醒，"有人在聊"这个事实是一样的，排期都该重新起算。
+    // 曾经这里会把排期从"收到消息"那一刻重新计 45 分钟。现在排期锚在
+    // turn/end（每轮对话真正结束的时刻），这里重排会被它覆盖，而且
+    // **每条消息都打一行「下次主动苏醒 N 分钟后」** —— 聊一晚日志就刷满了，
+    // 真正要看的东西全被埋掉。
     //
-    // 这条是 2026-11-19 用户实测反馈的根治办法：「我刚跟会话完成一轮对话，
-    // 刚静下来 10 分钟，然后被主动唤醒重新拉起了会话」—— 因为那时排期是
-    // 按"上次苏醒 + 固定间隔"算的，跟你什么时候说完话完全无关。
-    this.#postponeWakeSchedule(conv.key);
+    // 安全性：lastMessageAt 在上面（第 361 行左右）已经更新，
+    // #proactiveAttempt 里的 proactiveQuietSec（默认 120 秒）照样能挡住
+    // "消息刚进来就被主动苏醒打断"。
 
     // ⚠️ 如果有长轮询在等，这条消息**已经直接交给它了** —— agent 会带着这批消息
     // 在同一次工具调用里继续跑。此时再安排缓冲期唤醒 = 把同一批消息叫醒两次，
@@ -1097,29 +1098,33 @@ export class QQCompanionRuntime {
 
     // 正在 qq_wait_for_messages 里等 → 那就是"还在聊"，不该插话。
     // （2026-11-18 加的 hasActiveWaiter；即使对话已结束，这条也能挡住长轮询期间的空隙。）
+    //
+    // 不重排（2026-11-19 下午）：wait 发生在 turn 内部，turn/end 会重排。
     if (this.activeWaits.has(key)) {
-      this.log(`🌙 主动苏醒跳过 ${key}：正在 qq_wait_for_messages 里等，不插话`);
-      this.#reschedule(key, now, { reason: 'waiting' });
+      this.log(`🌙 主动苏醒跳过 ${key}：正在 qq_wait_for_messages 里等，不插话（等 turn/end）`);
       return;
     }
 
     // 刚聊过也别插话：#isBusy 挡不住"两个 turn 之间"的空隙（turn/end 一到
     // busy 就变 false，而对话是密集切换的）。要求"安静够久"才允许主动开口。
+    //
+    // 不重排（2026-11-19 下午）：turn/end 会重排，这里再排一次只是多打一行日志。
+    // 排期保持 due 状态，下一轮轮询再来看 —— 只要还在聊就一直跳过，聊完了
+    // turn/end 自然把它推走。
     const quietMs = Math.max(0, Number(wake.proactiveQuietSec ?? 120)) * 1000;
     const lastAt = this.lastMessageAt.get(key) ?? 0;
     if (quietMs > 0 && lastAt > 0 && Date.now() - lastAt < quietMs) {
       const ago = Math.round((Date.now() - lastAt) / 1000);
-      this.log(`🌙 主动苏醒跳过 ${key}：${ago}s 前刚聊过（需静默 ${quietMs / 1000}s）`);
-      this.#reschedule(key, now, { reason: 'recent-chat' });
+      this.log(`🌙 主动苏醒跳过 ${key}：${ago}s 前刚聊过（需静默 ${quietMs / 1000}s，等 turn/end）`);
       return;
     }
 
     const gate = this.#admitWake(key, wake);
     if (!gate.ok) {
-      // 用户 2026-11-19 明确：被冷却拦住就**丢弃这一次、正常重算下一次**，
-      // 不要为了绕开冷却去篡改间隔。
-      this.log(`🌙 主动苏醒跳过 ${key}：${gate.why} —— 本次丢弃，重排下一次`);
-      this.#reschedule(key, now, { reason: 'cooldown' });
+      // 只剩每小时上限这一道闸了（冷却已删）。超限是**延后**不是丢弃，
+      // 所以这里要重排 —— 没有别人会来推它。
+      this.log(`🌙 主动苏醒跳过 ${key}：${gate.why} —— 延后到下一次`);
+      this.#reschedule(key, now, { reason: 'hour-limit' });
       return;
     }
 
@@ -1229,26 +1234,6 @@ export class QQCompanionRuntime {
       this.#reschedule(key, now, { reason });
     }
     this.log(`↻ 已重排 ${this.wakeSchedule.size} 个会话的主动苏醒（原因：${reason}）`);
-  }
-
-  /**
-   * 主人刚说过话 → 把排期往后推。
-   *
-   * 这是"聊完 10 分钟就被叫醒"的根治办法（2026-11-19 用户实测反馈）。
-   *
-   * 为什么这条不会重踩 2026-11-03 那个坑：
-   *   · 那时错在让**冷却**去看 lastWakeAt（那个会被消息刷新），结果"越常聊天越不主动"；
-   *   · 这里刷新的是**排期**，语义就是"聊完才开始计时"——你一直在说话，
-   *     它就不该主动找你，这本来就是想要的。
-   * 语义上的区别：**冷却**问的是"两次苏醒隔够久了吗"，**排期**问的是"下次该什么时候醒"。
-   * 前者的答案不该受你说话影响，后者正该受影响。
-   */
-  #postponeWakeSchedule(key) {
-    const wake = this.effectiveWake(key);
-    if (wake.proactive === false) return;
-    // 只对真正参与主动苏醒的会话生效（绑定的私聊），别给群聊之类的也建条目
-    if (!this.#proactiveKeys().includes(key)) return;
-    this.#reschedule(key, Date.now(), { reason: 'after-message' });
   }
 
   /**
