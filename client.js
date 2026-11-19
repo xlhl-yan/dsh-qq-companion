@@ -43,6 +43,7 @@ window.__ModuleLoader__.load({
 .qqc-label { flex: 1 1 auto; min-width: 0; }
 .qqc-labelText { font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 6px; }
 .qqc-help { font-size: 11.5px; opacity: .55; margin-top: 3px; line-height: 1.5; }
+.qqc-key { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; font-weight: 400; opacity: .5; letter-spacing: 0; white-space: nowrap; user-select: all; }
 .qqc-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dsh-accent, #4b8bf5); flex: 0 0 auto; }
 .qqc-control { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
 .qqc-input { width: 210px; padding: 6px 9px; font-size: 12.5px; border-radius: 7px; border: 1px solid var(--dsh-border-default, rgba(128,128,128,.32)); background: var(--dsh-surface, transparent); color: inherit; outline: none; font-family: inherit; }
@@ -286,6 +287,14 @@ window.__ModuleLoader__.load({
                     { className: 'qqc-labelText' },
                     field.overridden ? h('span', { className: 'qqc-dot', title: '已被设置页覆盖' }) : null,
                     field.label,
+                    // 把代码里的真实 key 也显示出来。
+                    //
+                    // 起因（2026-11-19 用户）：会话里经常被要求「改一下
+                    // wake.wakeIntervalSec」，但用户在设置页只看到「苏醒间隔（秒）」，
+                    // 对不上号，得挨个试或者来问。把 key 直接摆在 label 后面就完了。
+                    //
+                    // user-select: all —— 点一下就能整段选中复制，省得手拖。
+                    h('code', { className: 'qqc-key', title: '代码里的配置键（点一下可全选）' }, field.key),
                   ),
                   field.help ? h('div', { className: 'qqc-help' }, field.help) : null,
                 ),
@@ -307,7 +316,16 @@ window.__ModuleLoader__.load({
               h(
                 'div',
                 { className: 'qqc-row', key: field.key },
-                h('div', { className: 'qqc-label' }, h('div', { className: 'qqc-labelText' }, field.label)),
+                h(
+                  'div',
+                  { className: 'qqc-label' },
+                  h(
+                    'div',
+                    { className: 'qqc-labelText' },
+                    field.label,
+                    h('code', { className: 'qqc-key', title: '代码里的配置键（点一下可全选）' }, field.key),
+                  ),
+                ),
                 h('div', { className: 'qqc-control' }, renderControl(field)),
               ),
             ),
