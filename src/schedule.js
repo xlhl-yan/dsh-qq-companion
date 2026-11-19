@@ -73,29 +73,56 @@ export function computeIntervalMs({
  * @param {number} endHour - 静默终点（如 9）
  * @returns {number} 若不在窗口内原样返回；否则顺延到窗口结束后第一个整点
  */
-export function skipQuietWindow(ts, startHour, endHour) {
-  const start = clampHour(startHour, 23);
-  const end = clampHour(endHour, 9);
-  if (start === end) return ts; // 起止相同 = 全天可醒
+/**
+ * 把一个时间戳从静默窗口里推出来。
+ *
+ * ## 参数是「活跃窗口」，不是「静默窗口」
+ *
+ * 2026-11-19 这里出过一次真实的线上问题：函数原来要求传**静默窗口**
+ * （如 23 → 9），而调用方手里有的只是配置里的**活跃窗口**
+ * （`activeStartHour=9` / `activeEndHour=23`）。调用处把两者直接传了进去，
+ * 于是函数把「9 点到 23 点」当成了静默时段 ——
+ * 15:30 算出来的 16:15 被一路推到当天 23:00，日志里显示「468 分钟后苏醒」。
+ *
+ * 修法不是"在调用处交换两个参数"（那还是同一个陷阱，只是这次记住了），
+ * 而是**让函数接受调用方真正拥有的那个概念**：活跃窗口。
+ * 静默窗口由它自己反推：活跃 9–23 → 静默 23–9。
+ *
+ * @param {number} ts - 候选时间戳
+ * @param {number} activeStartHour - 活跃窗口起点（如 9）
+ * @param {number} activeEndHour - 活跃窗口终点（如 23）
+ * @returns {number} 若落在活跃窗口内原样返回；否则顺延到活跃窗口开始的那个整点
+ */
+export function skipQuietWindow(ts, activeStartHour, activeEndHour) {
+  const activeStart = clampHour(activeStartHour, 8);
+  const activeEnd = clampHour(activeEndHour, 23);
+  // 活跃窗口起止相同 = 全天都能醒 = 没有静默窗口
+  if (activeStart === activeEnd) return ts;
+
+  // 静默窗口 = 活跃窗口的补集
+  const quietStart = activeEnd;
+  const quietEnd = activeStart;
 
   const d = new Date(ts);
   const hour = d.getHours();
   const inQuiet =
-    start < end ? hour >= start && hour < end : hour >= start || hour < end;
+    quietStart < quietEnd
+      ? hour >= quietStart && hour < quietEnd
+      : hour >= quietStart || hour < quietEnd;
   if (!inQuiet) return ts;
 
   const out = new Date(ts);
-  if (start < end) {
-    // 同日窗口（如 2 点→6 点）：推到当天 end 点
-    out.setHours(end, 0, 0, 0);
+  if (quietStart < quietEnd) {
+    // 同日静默窗口（活跃窗口跨午夜时会出现，如活跃 22–6 → 静默 6–22）
+    out.setHours(quietEnd, 0, 0, 0);
     return out.getTime();
   }
 
-  // 跨午夜（23 → 9）：
-  //   · 23 点这一侧 → 明天 9 点
-  //   · 凌晨这一侧（< end）→ 当天 9 点
-  if (hour >= start) out.setDate(out.getDate() + 1);
-  out.setHours(end, 0, 0, 0);
+  // 跨午夜静默（最常见的形态：活跃 9–23 → 静默 23–9）
+  //   · 23 点这一侧 → 明天 activeStart 点
+  //   · 凌晨这一侧（< activeStart）→ 当天 activeStart 点
+  if (hour >= quietStart) out.setDate(out.getDate() + 1);
+  out.setHours(quietEnd, 0, 0, 0);
   return out.getTime();
 }
 

@@ -1178,7 +1178,13 @@ export class QQCompanionRuntime {
         inWork,
       });
 
-      // 落在夜间静默窗口里就顺延到窗口结束后第一个整点
+      // 落在夜间静默窗口里就顺延到活跃窗口开始的那个整点。
+      //
+      // 传的是**活跃窗口**（activeStartHour / activeEndHour），静默窗口由
+      // skipQuietWindow 自己反推。2026-11-19 这里曾把两个概念搞混过：
+      // 函数当时要静默窗口，调用传了活跃窗口，于是白天被当成静默时段 ——
+      // 15:30 算出的 16:15 被推到 23:00，日志显示「468 分钟后苏醒」。
+      // 现在函数接受活跃窗口，语义和这里一致，不会再传反。
       const nextAt = skipQuietWindow(
         now + intervalMs,
         wake.activeStartHour,
